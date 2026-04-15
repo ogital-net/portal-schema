@@ -216,27 +216,8 @@ CREATE TYPE device_status AS ENUM (
     'decommissioned' -- permanently retired
 );
 
--- Coarse categorization of where a device is physically installed.  Detailed
--- free-text goes in network_devices.location_description.
-CREATE TYPE device_location_type AS ENUM (
-    'unit',
-    'hallway',
-    'lobby',
-    'stairwell',
-    'elevator',
-    'parking_garage',
-    'parking_lot',
-    'community_room',
-    'fitness_center',
-    'pool_area',
-    'rooftop',
-    'utility_room',
-    'mdf',           -- main distribution frame / telecom closet
-    'idf',           -- intermediate distribution frame
-    'outdoor',
-    'storage',
-    'other'
-);
+-- device_location_type enum removed; replaced by the device_location_types lookup
+-- table below, which supports per-tenant customization.
 
 CREATE TYPE wifi_security AS ENUM (
     'open',
@@ -697,6 +678,86 @@ CREATE TRIGGER trg_ap_groups_set_updated_at
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ---------------------------------------------------------------------------
+-- device_location_types
+-- Lookup table for the coarse physical location category of a network device.
+-- Detailed free-text goes in network_devices.location_description.
+--
+-- Rows with tenant_id IS NULL are platform-wide defaults visible to every
+-- tenant.  Rows with tenant_id set are private to that tenant, allowing them
+-- to add custom location categories without touching the global list.
+--
+-- Global default rows are seeded by the INSERT block below.  Tenants may
+-- mark global rows as hidden by creating a tenant-scoped row with the same
+-- slug and is_active = FALSE (application-layer convention; not enforced
+-- by the DB).  The slug is the stable machine-readable key; label is the
+-- human-facing display string.
+-- ---------------------------------------------------------------------------
+CREATE TABLE device_location_types (
+    id          BIGSERIAL   PRIMARY KEY,
+    uuid        UUID        NOT NULL DEFAULT uuidv7(),
+
+    -- NULL = global platform default; NOT NULL = tenant-specific custom type
+    tenant_id   BIGINT,
+
+    slug        TEXT        NOT NULL,   -- stable machine key, e.g. 'mdf', 'unit'
+    label       TEXT        NOT NULL,   -- display name, e.g. 'MDF / Telecom Closet'
+    description TEXT,                   -- optional longer description for UI tooltips
+    sort_order  SMALLINT    NOT NULL DEFAULT 0,
+                            -- controls display ordering within a category list
+    is_active   BOOLEAN     NOT NULL DEFAULT TRUE,
+
+    -- Timestamps
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_device_location_types_uuid UNIQUE (uuid),
+
+    -- Global slugs must be unique across all global rows
+    CONSTRAINT uq_device_location_types_global_slug
+        UNIQUE NULLS NOT DISTINCT (tenant_id, slug),
+
+    CONSTRAINT fk_device_location_types_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX idx_device_location_types_tenant_id ON device_location_types (tenant_id)
+    WHERE tenant_id IS NOT NULL;
+CREATE INDEX idx_device_location_types_slug      ON device_location_types (slug);
+CREATE INDEX idx_device_location_types_is_active ON device_location_types (is_active);
+
+CREATE TRIGGER trg_device_location_types_set_updated_at
+    BEFORE UPDATE ON device_location_types
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Global default location types (tenant_id = NULL)
+INSERT INTO device_location_types (tenant_id, slug, label, description, sort_order) VALUES
+    (NULL, 'unit',           'Unit',                    'Inside a resident unit',                                           10),
+    (NULL, 'hallway',        'Hallway',                 'Corridor or hallway on a residential floor',                       20),
+    (NULL, 'lobby',          'Lobby',                   'Building entrance lobby or vestibule',                             30),
+    (NULL, 'stairwell',      'Stairwell',               'Staircase or stairwell enclosure',                                 40),
+    (NULL, 'elevator',       'Elevator',                'Inside or on top of an elevator cab or shaft',                     50),
+    (NULL, 'parking_garage', 'Parking Garage',          'Interior structured parking garage',                               60),
+    (NULL, 'parking_lot',    'Parking Lot',             'Surface-level outdoor parking area',                               70),
+    (NULL, 'community_room', 'Community Room',          'Shared resident amenity room (clubhouse, lounge, etc.)',            80),
+    (NULL, 'fitness_center', 'Fitness Center',          'Gym or fitness room',                                              90),
+    (NULL, 'pool_area',      'Pool Area',               'Indoor or outdoor pool and surrounding deck',                     100),
+    (NULL, 'rooftop',        'Rooftop',                 'Roof deck, rooftop amenity space, or rooftop equipment area',     110),
+    (NULL, 'utility_room',   'Utility Room',            'General mechanical / electrical / utility room',                  120),
+    (NULL, 'mdf',            'MDF / Telecom Closet',    'Main distribution frame or primary telecom/network closet',       130),
+    (NULL, 'idf',            'IDF',                     'Intermediate distribution frame or satellite network closet',     140),
+    (NULL, 'server_room',    'Server Room',             'Dedicated server or data closet (not a full DC)',                 150),
+    (NULL, 'leasing_office', 'Leasing Office',          'Property management or leasing office',                           160),
+    (NULL, 'mailroom',       'Mail Room',               'Package room, mail room, or parcel locker area',                  170),
+    (NULL, 'laundry_room',   'Laundry Room',            'Common-area laundry facility',                                    180),
+    (NULL, 'business_center','Business Center',         'Shared co-working or business center space',                      190),
+    (NULL, 'courtyard',      'Courtyard',               'Open-air courtyard or interior outdoor common area',              200),
+    (NULL, 'outdoor',        'Outdoor',                 'General outdoor area not covered by a more specific type',        210),
+    (NULL, 'storage',        'Storage',                 'Storage room or storage unit area',                               220),
+    (NULL, 'other',          'Other',                   'Location type not covered by any other category',                 999);
+
+-- ---------------------------------------------------------------------------
 -- network_devices
 -- One row per physical piece of managed network equipment installed at a
 -- property.  Provides identity, location, and operational status fields
@@ -729,7 +790,7 @@ CREATE TABLE network_devices (
     mgmt_ip          INET,
 
     -- Physical placement
-    location_type        device_location_type NOT NULL DEFAULT 'other',
+    location_type_id     BIGINT,          -- FK → device_location_types; NULL = unclassified
     location_description TEXT,           -- e.g. "Above front door, near elevator 2"
 
     -- Lifecycle
@@ -776,7 +837,12 @@ CREATE TABLE network_devices (
     CONSTRAINT fk_network_devices_tenant
         FOREIGN KEY (tenant_id)
         REFERENCES tenants (id)
-        ON DELETE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_network_devices_location_type
+        FOREIGN KEY (location_type_id)
+        REFERENCES device_location_types (id)
+        ON DELETE SET NULL
 );
 
 -- Serial numbers are unique within a manufacturer's namespace
@@ -804,6 +870,8 @@ CREATE INDEX idx_network_devices_building_id     ON network_devices (building_id
 CREATE INDEX idx_network_devices_unit_id         ON network_devices (unit_id);
 CREATE INDEX idx_network_devices_manufacturer_id ON network_devices (manufacturer_id);
 CREATE INDEX idx_network_devices_status          ON network_devices (status);
+CREATE INDEX idx_network_devices_location_type_id ON network_devices (location_type_id)
+    WHERE location_type_id IS NOT NULL;
 CREATE INDEX idx_network_devices_device_type     ON network_devices (device_type);
 CREATE INDEX idx_network_devices_poller_id       ON network_devices (poller_id)
     WHERE poller_id IS NOT NULL;
