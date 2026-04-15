@@ -286,6 +286,48 @@ CREATE TYPE building_construction_type AS ENUM (
     'other'
 );
 
+-- Physical-layer distribution technology used to deliver connectivity inside
+-- the building from the MDF/head-end to individual units or floors.
+CREATE TYPE building_distribution_tech AS ENUM (
+    -- Active Ethernet (point-to-point switched Ethernet runs to each unit)
+    'active_ethernet_copper',   -- Cat5e/Cat6/Cat6A copper to each unit
+    'active_ethernet_fiber',    -- dedicated single-mode or multimode fiber to each unit
+
+    -- Passive Optical Network (shared fiber, PON splitter in riser/IDF)
+    'gpon',                     -- ITU-T G.984 GPON — up to 2.5 Gbps down / 1.25 Gbps up shared
+    'xgs_pon',                  -- ITU-T G.9807 XGS-PON — 10 Gbps symmetric shared
+    'ng_pon2',                  -- ITU-T G.989 NG-PON2 — 40 Gbps (4×10G wavelengths)
+    'epon',                     -- IEEE 802.3ah EPON — 1 Gbps shared (less common in MDU)
+    '10g_epon',                 -- IEEE 802.3av 10G-EPON — 10 Gbps shared
+
+    -- Copper-based broadband (existing telephone or coax wiring reused)
+    'vdsl2',                    -- VDSL2 (G.993.2) over existing telephone copper
+    'vdsl2_vectoring',          -- VDSL2 with G.993.5 vectoring / crosstalk cancellation
+    'gfast',                    -- G.fast (G.9700/G.9701) — up to 1 Gbps over short copper
+    'adsl2_plus',               -- ADSL2+ legacy DSL (older MDU installs)
+
+    -- G.hn — ITU-T G.9960/G.9961 home networking over existing building wiring
+    'ghn_coax',                 -- G.hn over existing coaxial cable
+    'ghn_copper',               -- G.hn over existing telephone-grade copper pairs
+    'ghn_powerline',            -- G.hn over in-building power line (less common in MDU)
+
+    -- Cable / DOCSIS (coaxial HFC plant)
+    'docsis_3_0',               -- DOCSIS 3.0 — up to 1 Gbps down shared
+    'docsis_3_1',               -- DOCSIS 3.1 — up to 10 Gbps down shared
+    'docsis_4_0',               -- DOCSIS 4.0 — 10 Gbps full-duplex
+
+    -- Wireless distribution inside building
+    'moca',                     -- MoCA over existing coax (point-to-point, set-top/gateway backhauling)
+    'wimax',                    -- 802.16 WiMAX fixed wireless (uncommon, legacy)
+
+    -- Hybrid / multi-technology
+    'hybrid_fiber_copper',      -- fiber to IDF then copper to unit (e.g. VDSL2 from IDF)
+    'hybrid_fiber_coax',        -- fiber to node then DOCSIS coax to unit (HFC)
+    'hybrid_fiber_ghn',         -- fiber to IDF then G.hn over existing wiring to unit
+
+    'other'                     -- proprietary or unlisted technology
+);
+
 -- ---------------------------------------------------------------------------
 -- organizations
 -- A service-provider sub-entity or brand under a tenant.  One tenant may
@@ -447,9 +489,11 @@ CREATE TABLE buildings (
     country       TEXT,
 
     -- Physical attributes
-    year_built      SMALLINT,
-    total_floors    SMALLINT,
-    construction_type building_construction_type,
+    year_built          SMALLINT,
+    total_floors        SMALLINT,
+    construction_type   building_construction_type,
+    distribution_tech   building_distribution_tech,
+                        -- physical-layer technology delivering connectivity to units
 
     -- Accessibility
     has_elevator    BOOLEAN     NOT NULL DEFAULT FALSE,
