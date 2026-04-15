@@ -5,7 +5,9 @@
 --   tenants                 — top-level SaaS tenant (service provider / ISP)
 --   platform_config         — per-tenant branding and platform configuration
 --   organizations           — service provider sub-entities / brands under a tenant
+--   property_management_companies — companies responsible for day-to-day property management
 --   properties              — physical buildings / complexes
+--   property_contacts       — individual contacts per property displayed to residents
 --   buildings               — individual structures within a property
 --   units                   — individual rentable spaces
 --   manufacturers           — hardware vendor registry
@@ -375,6 +377,82 @@ CREATE TRIGGER trg_organizations_set_updated_at
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ---------------------------------------------------------------------------
+-- property_management_companies
+-- A company (or individual operator) engaged to handle day-to-day operations
+-- for one or more properties owned by an organization.  The organization is
+-- the asset owner / ISP account; the management company may be the owner's
+-- own internal team or a third-party property-management firm.
+--
+-- Scoped to an organization: a management company record belongs to exactly
+-- one organization and is not shared across organizations.
+-- ---------------------------------------------------------------------------
+CREATE TABLE property_management_companies (
+    id              BIGSERIAL   PRIMARY KEY,
+    uuid            UUID        NOT NULL DEFAULT uuidv7(),
+    tenant_id       BIGINT      NOT NULL,
+    organization_id BIGINT      NOT NULL,  -- the organization that engaged this management company
+
+    -- Identity
+    name        TEXT        NOT NULL,
+    website     TEXT,
+
+    -- Primary contact info (company-level; individual contacts go in property_contacts)
+    phone       TEXT,           -- main office line
+    fax         TEXT,
+    email       CITEXT,         -- general inbox, e.g. info@acmeproperty.com
+
+    -- Mailing / registered office address
+    address_line1   TEXT,
+    address_line2   TEXT,
+    city            TEXT,
+    state           TEXT,
+    postal_code     TEXT,
+    country         TEXT        NOT NULL DEFAULT 'US',
+
+    -- Timestamps
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at  TIMESTAMPTZ,
+
+    CONSTRAINT uq_property_management_companies_uuid
+        UNIQUE (uuid),
+
+    CONSTRAINT chk_property_management_companies_country_len
+        CHECK (char_length(country) = 2),
+
+    -- Address is either fully present or fully absent
+    CONSTRAINT chk_property_management_companies_address_complete
+        CHECK (
+            (address_line1 IS NULL AND city IS NULL AND state IS NULL AND
+             postal_code IS NULL)
+            OR
+            (address_line1 IS NOT NULL AND city IS NOT NULL AND state IS NOT NULL AND
+             postal_code IS NOT NULL)
+        ),
+
+    CONSTRAINT fk_property_management_companies_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_property_management_companies_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES organizations (id)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_property_management_companies_tenant_id
+    ON property_management_companies (tenant_id);
+CREATE INDEX idx_property_management_companies_organization_id
+    ON property_management_companies (organization_id);
+CREATE INDEX idx_property_management_companies_deleted_at
+    ON property_management_companies (deleted_at);
+
+CREATE TRIGGER trg_property_management_companies_set_updated_at
+    BEFORE UPDATE ON property_management_companies
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
 -- properties
 -- A physical property (building, complex, campus) managed by an organization.
 -- One organization may own many properties.
@@ -384,6 +462,7 @@ CREATE TABLE properties (
     uuid            UUID            NOT NULL DEFAULT uuidv7(),
     tenant_id       BIGINT          NOT NULL,
     organization_id BIGINT          NOT NULL,
+    management_company_id BIGINT,   -- NULL until assigned; links to property_management_companies
 
     -- Identity
     name            TEXT            NOT NULL,
@@ -448,12 +527,19 @@ CREATE TABLE properties (
     CONSTRAINT fk_properties_tenant
         FOREIGN KEY (tenant_id)
         REFERENCES tenants (id)
-        ON DELETE RESTRICT
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_properties_management_company
+        FOREIGN KEY (management_company_id)
+        REFERENCES property_management_companies (id)
+        ON DELETE SET NULL
 );
 
-CREATE INDEX idx_properties_tenant_id       ON properties (tenant_id);
-CREATE INDEX idx_properties_organization_id ON properties (organization_id);
-CREATE INDEX idx_properties_deleted_at      ON properties (deleted_at);
+CREATE INDEX idx_properties_tenant_id            ON properties (tenant_id);
+CREATE INDEX idx_properties_organization_id      ON properties (organization_id);
+CREATE INDEX idx_properties_management_company_id ON properties (management_company_id)
+    WHERE management_company_id IS NOT NULL;
+CREATE INDEX idx_properties_deleted_at           ON properties (deleted_at);
 
 -- Spatial lookup: find all properties within a bounding box
 CREATE INDEX idx_properties_geo ON properties (latitude, longitude)
@@ -461,6 +547,111 @@ CREATE INDEX idx_properties_geo ON properties (latitude, longitude)
 
 CREATE TRIGGER trg_properties_set_updated_at
     BEFORE UPDATE ON properties
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- property_contact_role enum
+-- ---------------------------------------------------------------------------
+CREATE TYPE property_contact_role AS ENUM (
+    'property_manager',  -- primary day-to-day manager; main point of contact
+    'assistant_manager', -- secondary manager / backup contact
+    'leasing',           -- leasing office: move-ins, move-outs, applications
+    'maintenance',       -- maintenance requests and repair coordination
+    'emergency',         -- after-hours emergency line (could be a service, not a person)
+    'billing',           -- rent payments, billing disputes, fee questions
+    'concierge',         -- front-desk / doorman service (for luxury/high-rise)
+    'general'            -- general inquiries not covered by other roles
+);
+
+-- ---------------------------------------------------------------------------
+-- property_contacts
+-- Individual contacts (people or role-based lines) associated with a property.
+-- Multiple contacts per property are supported; mark one per role as primary.
+-- These records are displayed to residents in the portal.
+-- ---------------------------------------------------------------------------
+CREATE TABLE property_contacts (
+    id                      BIGSERIAL               PRIMARY KEY,
+    uuid                    UUID                    NOT NULL DEFAULT uuidv7(),
+    tenant_id               BIGINT                  NOT NULL,
+    property_id             BIGINT                  NOT NULL,
+
+    -- Optionally link to the management company this person works for
+    management_company_id   BIGINT,
+
+    -- Role this contact fills at the property
+    role                    property_contact_role   NOT NULL DEFAULT 'general',
+
+    -- Flag the primary contact for each role (used for default display ordering)
+    is_primary              BOOLEAN                 NOT NULL DEFAULT FALSE,
+
+    -- Person identity (nullable: emergency lines may have no named individual)
+    first_name              TEXT,
+    last_name               TEXT,
+    title                   TEXT,   -- e.g. "Property Manager", "Leasing Director"
+
+    -- Contact channels
+    phone                   TEXT,           -- primary phone / office line
+    phone_ext               TEXT,           -- extension for office PBX systems
+    phone_after_hours       TEXT,           -- emergency / after-hours line
+    email                   CITEXT,         -- contact email shown to residents
+    email_secondary         CITEXT,         -- secondary or department-level email
+
+    -- Availability note shown to residents (free-form)
+    -- e.g. "Mon–Fri 9 am–5 pm EST", "24/7 answering service"
+    office_hours            TEXT,
+
+    -- Portal display
+    display_name            TEXT,           -- override shown in portal if set;
+                                            -- falls back to first_name + last_name
+    profile_photo_url       TEXT,           -- optional headshot for display
+    is_visible_to_residents BOOLEAN         NOT NULL DEFAULT TRUE,
+
+    -- Internal notes (not shown to residents)
+    notes                   TEXT,
+
+    -- Sort order within a role group (lower = shown first)
+    sort_order              SMALLINT        NOT NULL DEFAULT 0,
+
+    -- Timestamps
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at  TIMESTAMPTZ,
+
+    CONSTRAINT uq_property_contacts_uuid UNIQUE (uuid),
+
+    CONSTRAINT fk_property_contacts_property
+        FOREIGN KEY (property_id)
+        REFERENCES properties (id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_property_contacts_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_property_contacts_management_company
+        FOREIGN KEY (management_company_id)
+        REFERENCES property_management_companies (id)
+        ON DELETE SET NULL
+);
+
+CREATE INDEX idx_property_contacts_property_id
+    ON property_contacts (property_id);
+CREATE INDEX idx_property_contacts_tenant_id
+    ON property_contacts (tenant_id);
+CREATE INDEX idx_property_contacts_management_company_id
+    ON property_contacts (management_company_id)
+    WHERE management_company_id IS NOT NULL;
+CREATE INDEX idx_property_contacts_deleted_at
+    ON property_contacts (deleted_at);
+
+-- Partial index to quickly fetch visible contacts for resident portal queries
+CREATE INDEX idx_property_contacts_visible
+    ON property_contacts (property_id, role, sort_order)
+    WHERE is_visible_to_residents = TRUE AND deleted_at IS NULL;
+
+CREATE TRIGGER trg_property_contacts_set_updated_at
+    BEFORE UPDATE ON property_contacts
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ---------------------------------------------------------------------------
