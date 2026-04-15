@@ -1,0 +1,23 @@
+[package]
+name = "portal-schema-test"
+version = "0.1.0"
+edition = "2021"
+description = "Migration smoke-test: spins up a PostgreSQL 18 container and applies all migrations."
+
+[[bin]]
+name = "test-migrations"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# PostgreSQL client
+tokio-postgres = "0.7"
+
+# Migration runner
+refinery = { version = "0.9", features = ["tokio-postgres"] }
+
+# Test containers
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }

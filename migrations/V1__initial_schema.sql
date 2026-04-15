@@ -2,18 +2,25 @@
 -- V1: Initial Schema
 --
 -- Tables (in dependency order):
---   organizations       — service provider / ISP accounts
---   properties          — physical buildings / complexes
---   buildings           — individual structures within a property
---   units               — individual rentable spaces
---   manufacturers       — hardware vendor registry
---   ap_groups           — WiFi configuration profiles (SSID, security, VLAN)
---   network_devices     — all managed network equipment at a property
---   access_points       — AP-specific detail (1:1 with network_devices)
---   switches            — switch-specific detail (1:1 with network_devices)
---   gateways            — gateway-specific detail (1:1 with network_devices)
---   unit_networks       — per-unit VLAN + IPv4/IPv6 network config
---   device_credentials  — encrypted management credentials per device
+--   tenants                 — top-level SaaS tenant (service provider / ISP)
+--   platform_config         — per-tenant branding and platform configuration
+--   organizations           — service provider sub-entities / brands under a tenant
+--   properties              — physical buildings / complexes
+--   buildings               — individual structures within a property
+--   units                   — individual rentable spaces
+--   manufacturers           — hardware vendor registry
+--   ap_groups               — WiFi configuration profiles (SSID, security, VLAN)
+--   network_devices         — all managed network equipment at a property
+--   access_points           — AP-specific detail (1:1 with network_devices)
+--   switches                — switch-specific detail (1:1 with network_devices)
+--   gateways                — gateway-specific detail (1:1 with network_devices)
+--   unit_networks           — per-unit VLAN + IPv4/IPv6 network config
+--   device_credentials      — encrypted management credentials per device
+--   service_plans           — available network service tiers
+--   service_accounts        — contracted service period for a unit
+--   users                   — human user accounts (Cognito-backed)
+--   user_units              — M:M: users ↔ units
+--   service_account_users   — M:M: users ↔ service accounts
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -38,6 +45,100 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+-- ---------------------------------------------------------------------------
+-- tenants
+-- The top-level SaaS entity.  Each tenant is a service provider / ISP that
+-- signs up to use the platform.  Every other table is scoped to a tenant.
+-- ---------------------------------------------------------------------------
+CREATE TABLE tenants (
+    id          BIGSERIAL   PRIMARY KEY,
+    uuid        UUID        NOT NULL DEFAULT uuidv7(),
+
+    -- Identity
+    name        TEXT        NOT NULL,
+    slug        TEXT        NOT NULL,   -- URL-safe subdomain identifier, e.g. "acme-isp"
+
+    -- Contact
+    phone       TEXT,
+    email       CITEXT,
+    website     TEXT,
+
+    -- Account state
+    is_active   BOOLEAN     NOT NULL DEFAULT TRUE,
+
+    -- Timestamps
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at  TIMESTAMPTZ,
+
+    CONSTRAINT uq_tenants_uuid UNIQUE (uuid),
+    CONSTRAINT uq_tenants_name UNIQUE (name),
+    CONSTRAINT uq_tenants_slug UNIQUE (slug),
+    CONSTRAINT chk_tenants_slug_format CHECK (slug ~ '^[a-z0-9][a-z0-9-]*[a-z0-9]$')
+);
+
+CREATE INDEX idx_tenants_slug       ON tenants (slug);
+CREATE INDEX idx_tenants_is_active  ON tenants (is_active);
+CREATE INDEX idx_tenants_deleted_at ON tenants (deleted_at);
+
+CREATE TRIGGER trg_tenants_set_updated_at
+    BEFORE UPDATE ON tenants
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- platform_config
+-- Per-tenant portal branding and configuration.  1:1 with tenants.
+-- A row is created for the tenant at sign-up and is always present;
+-- use NULL fields to indicate "use platform default".
+-- ---------------------------------------------------------------------------
+CREATE TABLE platform_config (
+    id          BIGSERIAL   PRIMARY KEY,
+    uuid        UUID        NOT NULL DEFAULT uuidv7(),
+    tenant_id   BIGINT      NOT NULL,
+
+    -- Branding — displayed in the portal UI
+    platform_name   TEXT,           -- override for the product name shown in the UI
+    logo_url        TEXT,           -- primary (light background) logo
+    logo_dark_url   TEXT,           -- dark-mode / inverted logo variant
+    favicon_url     TEXT,
+
+    -- Color palette (CSS hex values, e.g. '#1a73e8')
+    color_primary   TEXT,
+    color_secondary TEXT,
+    color_accent    TEXT,
+
+    -- Support contact shown to residents
+    support_email   CITEXT,
+    support_phone   TEXT,
+    support_url     TEXT,
+
+    -- Legal
+    terms_url       TEXT,
+    privacy_url     TEXT,
+
+    -- Catch-all for additional configuration not yet promoted to a typed column.
+    -- Application-defined keys; validated by the backend.
+    extra_config    JSONB       NOT NULL DEFAULT '{}',
+
+    -- Timestamps
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_platform_config_uuid      UNIQUE (uuid),
+    CONSTRAINT uq_platform_config_tenant_id UNIQUE (tenant_id),   -- 1:1 with tenants
+
+    CONSTRAINT fk_platform_config_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX idx_platform_config_tenant_id ON platform_config (tenant_id);
+
+CREATE TRIGGER trg_platform_config_set_updated_at
+    BEFORE UPDATE ON platform_config
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ---------------------------------------------------------------------------
 -- Enum Types
@@ -142,12 +243,13 @@ CREATE TYPE credential_type AS ENUM (
 
 -- ---------------------------------------------------------------------------
 -- organizations
--- The top-level service-provider / ISP entity that owns and operates
--- one or more properties.
+-- A service-provider sub-entity or brand under a tenant.  One tenant may
+-- have one or more organizations (e.g. parent ISP with regional brands).
 -- ---------------------------------------------------------------------------
 CREATE TABLE organizations (
     id           BIGSERIAL    PRIMARY KEY,
     uuid         UUID         NOT NULL DEFAULT uuidv7(),
+    tenant_id    BIGINT       NOT NULL,
 
     -- Identity
     name         CITEXT       NOT NULL,
@@ -168,11 +270,17 @@ CREATE TABLE organizations (
     updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     deleted_at   TIMESTAMPTZ,
 
-    CONSTRAINT uq_organizations_uuid  UNIQUE (uuid),
-    CONSTRAINT uq_organizations_name  UNIQUE (name),
-    CONSTRAINT chk_organizations_country_len CHECK (char_length(country) = 2)
+    CONSTRAINT uq_organizations_uuid       UNIQUE (uuid),
+    CONSTRAINT uq_organizations_tenant_name UNIQUE (tenant_id, name),
+    CONSTRAINT chk_organizations_country_len CHECK (char_length(country) = 2),
+
+    CONSTRAINT fk_organizations_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
 );
 
+CREATE INDEX idx_organizations_tenant_id  ON organizations (tenant_id);
 CREATE INDEX idx_organizations_deleted_at ON organizations (deleted_at);
 
 CREATE TRIGGER trg_organizations_set_updated_at
@@ -187,6 +295,7 @@ CREATE TRIGGER trg_organizations_set_updated_at
 CREATE TABLE properties (
     id              BIGSERIAL       PRIMARY KEY,
     uuid            UUID            NOT NULL DEFAULT uuidv7(),
+    tenant_id       BIGINT          NOT NULL,
     organization_id BIGINT          NOT NULL,
 
     -- Identity
@@ -231,9 +340,15 @@ CREATE TABLE properties (
     CONSTRAINT fk_properties_organization
         FOREIGN KEY (organization_id)
         REFERENCES organizations (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_properties_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
         ON DELETE RESTRICT
 );
 
+CREATE INDEX idx_properties_tenant_id       ON properties (tenant_id);
 CREATE INDEX idx_properties_organization_id ON properties (organization_id);
 CREATE INDEX idx_properties_deleted_at      ON properties (deleted_at);
 
@@ -254,6 +369,7 @@ CREATE TRIGGER trg_properties_set_updated_at
 CREATE TABLE buildings (
     id          BIGSERIAL   PRIMARY KEY,
     uuid        UUID        NOT NULL DEFAULT uuidv7(),
+    tenant_id   BIGINT      NOT NULL,
     property_id BIGINT      NOT NULL,
 
     -- Identity
@@ -301,9 +417,15 @@ CREATE TABLE buildings (
     CONSTRAINT fk_buildings_property
         FOREIGN KEY (property_id)
         REFERENCES properties (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_buildings_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
         ON DELETE RESTRICT
 );
 
+CREATE INDEX idx_buildings_tenant_id   ON buildings (tenant_id);
 CREATE INDEX idx_buildings_property_id ON buildings (property_id);
 CREATE INDEX idx_buildings_deleted_at  ON buildings (deleted_at);
 
@@ -320,6 +442,7 @@ CREATE TRIGGER trg_buildings_set_updated_at
 CREATE TABLE units (
     id          BIGSERIAL   PRIMARY KEY,
     uuid        UUID        NOT NULL DEFAULT uuidv7(),
+    tenant_id   BIGINT      NOT NULL,
     property_id BIGINT      NOT NULL,
     building_id BIGINT,     -- NULL → unit belongs directly to the property
 
@@ -357,6 +480,11 @@ CREATE TABLE units (
     CONSTRAINT fk_units_building
         FOREIGN KEY (building_id)
         REFERENCES buildings (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_units_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
         ON DELETE RESTRICT
 );
 
@@ -370,6 +498,7 @@ CREATE UNIQUE INDEX uq_units_property_unit_number_no_building
     ON units (property_id, unit_number)
     WHERE building_id IS NULL AND deleted_at IS NULL;
 
+CREATE INDEX idx_units_tenant_id    ON units (tenant_id);
 CREATE INDEX idx_units_property_id  ON units (property_id);
 CREATE INDEX idx_units_building_id  ON units (building_id);
 CREATE INDEX idx_units_unit_type    ON units (unit_type);
@@ -387,6 +516,7 @@ CREATE TRIGGER trg_units_set_updated_at
 CREATE TABLE manufacturers (
     id          BIGSERIAL   PRIMARY KEY,
     uuid        UUID        NOT NULL DEFAULT uuidv7(),
+    tenant_id   BIGINT      NOT NULL,
 
     -- Identity
     name        TEXT        NOT NULL,   -- e.g. "Ubiquiti", "Cisco", "Aruba"
@@ -408,11 +538,17 @@ CREATE TABLE manufacturers (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     deleted_at  TIMESTAMPTZ,
 
-    CONSTRAINT uq_manufacturers_uuid       UNIQUE (uuid),
-    CONSTRAINT uq_manufacturers_name       UNIQUE (name),
-    CONSTRAINT uq_manufacturers_short_name UNIQUE (short_name)
+    CONSTRAINT uq_manufacturers_uuid             UNIQUE (uuid),
+    CONSTRAINT uq_manufacturers_tenant_name       UNIQUE (tenant_id, name),
+    CONSTRAINT uq_manufacturers_tenant_short_name UNIQUE (tenant_id, short_name),
+
+    CONSTRAINT fk_manufacturers_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
 );
 
+CREATE INDEX idx_manufacturers_tenant_id  ON manufacturers (tenant_id);
 CREATE INDEX idx_manufacturers_deleted_at ON manufacturers (deleted_at);
 
 CREATE TRIGGER trg_manufacturers_set_updated_at
@@ -428,6 +564,7 @@ CREATE TRIGGER trg_manufacturers_set_updated_at
 CREATE TABLE ap_groups (
     id          BIGSERIAL       PRIMARY KEY,
     uuid        UUID            NOT NULL DEFAULT uuidv7(),
+    tenant_id   BIGINT          NOT NULL,
     property_id BIGINT          NOT NULL,
 
     -- Identity
@@ -461,9 +598,15 @@ CREATE TABLE ap_groups (
     CONSTRAINT fk_ap_groups_property
         FOREIGN KEY (property_id)
         REFERENCES properties (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_ap_groups_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
         ON DELETE RESTRICT
 );
 
+CREATE INDEX idx_ap_groups_tenant_id   ON ap_groups (tenant_id);
 CREATE INDEX idx_ap_groups_property_id ON ap_groups (property_id);
 CREATE INDEX idx_ap_groups_deleted_at  ON ap_groups (deleted_at);
 
@@ -481,6 +624,7 @@ CREATE TRIGGER trg_ap_groups_set_updated_at
 CREATE TABLE network_devices (
     id               BIGSERIAL           PRIMARY KEY,
     uuid             UUID                NOT NULL DEFAULT uuidv7(),
+    tenant_id        BIGINT              NOT NULL,
 
     -- Ownership / location hierarchy — all three anchor to the same property;
     -- building_id and unit_id narrow the location further.
@@ -541,6 +685,11 @@ CREATE TABLE network_devices (
     CONSTRAINT fk_network_devices_manufacturer
         FOREIGN KEY (manufacturer_id)
         REFERENCES manufacturers (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_network_devices_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
         ON DELETE RESTRICT
 );
 
@@ -563,6 +712,7 @@ CREATE UNIQUE INDEX uq_network_devices_mac_address
     ON network_devices (mac_address)
     WHERE mac_address IS NOT NULL AND deleted_at IS NULL;
 
+CREATE INDEX idx_network_devices_tenant_id       ON network_devices (tenant_id);
 CREATE INDEX idx_network_devices_property_id     ON network_devices (property_id);
 CREATE INDEX idx_network_devices_building_id     ON network_devices (building_id);
 CREATE INDEX idx_network_devices_unit_id         ON network_devices (unit_id);
@@ -583,6 +733,7 @@ CREATE TRIGGER trg_network_devices_set_updated_at
 CREATE TABLE access_points (
     id                BIGSERIAL   PRIMARY KEY,
     uuid              UUID        NOT NULL DEFAULT uuidv7(),
+    tenant_id         BIGINT      NOT NULL,
     network_device_id BIGINT      NOT NULL,  -- 1:1 with network_devices
     ap_group_id       BIGINT,                -- NULL = not yet assigned to a group
 
@@ -630,9 +781,15 @@ CREATE TABLE access_points (
     CONSTRAINT fk_access_points_ap_group
         FOREIGN KEY (ap_group_id)
         REFERENCES ap_groups (id)
-        ON DELETE SET NULL   -- ungrouping an AP keeps it as an unassigned device
+        ON DELETE SET NULL,  -- ungrouping an AP keeps it as an unassigned device
+
+    CONSTRAINT fk_access_points_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
 );
 
+CREATE INDEX idx_access_points_tenant_id         ON access_points (tenant_id);
 CREATE INDEX idx_access_points_network_device_id ON access_points (network_device_id);
 CREATE INDEX idx_access_points_ap_group_id       ON access_points (ap_group_id);
 CREATE INDEX idx_access_points_deleted_at        ON access_points (deleted_at);
@@ -652,6 +809,7 @@ CREATE TRIGGER trg_access_points_set_updated_at
 CREATE TABLE switches (
     id                BIGSERIAL   PRIMARY KEY,
     uuid              UUID        NOT NULL DEFAULT uuidv7(),
+    tenant_id         BIGINT      NOT NULL,
     network_device_id BIGINT      NOT NULL,  -- 1:1 with network_devices
     uplink_device_id  BIGINT,                -- parent device in the hierarchy (NULL = root)
 
@@ -700,9 +858,15 @@ CREATE TABLE switches (
     CONSTRAINT fk_switches_uplink_device
         FOREIGN KEY (uplink_device_id)
         REFERENCES network_devices (id)
-        ON DELETE SET NULL
+        ON DELETE SET NULL,
+
+    CONSTRAINT fk_switches_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
 );
 
+CREATE INDEX idx_switches_tenant_id         ON switches (tenant_id);
 CREATE INDEX idx_switches_network_device_id ON switches (network_device_id);
 CREATE INDEX idx_switches_uplink_device_id  ON switches (uplink_device_id);
 CREATE INDEX idx_switches_role              ON switches (role);
@@ -722,6 +886,7 @@ CREATE TRIGGER trg_switches_set_updated_at
 CREATE TABLE gateways (
     id                BIGSERIAL       PRIMARY KEY,
     uuid              UUID            NOT NULL DEFAULT uuidv7(),
+    tenant_id         BIGINT          NOT NULL,
     network_device_id BIGINT          NOT NULL,
 
     -- WAN / upstream handoff (the interface facing the ISP or upstream router)
@@ -764,9 +929,15 @@ CREATE TABLE gateways (
     CONSTRAINT fk_gateways_ha_peer
         FOREIGN KEY (ha_peer_device_id)
         REFERENCES network_devices (id)
-        ON DELETE SET NULL
+        ON DELETE SET NULL,
+
+    CONSTRAINT fk_gateways_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
 );
 
+CREATE INDEX idx_gateways_tenant_id         ON gateways (tenant_id);
 CREATE INDEX idx_gateways_network_device_id ON gateways (network_device_id);
 CREATE INDEX idx_gateways_ha_peer_device_id ON gateways (ha_peer_device_id);
 CREATE INDEX idx_gateways_deleted_at        ON gateways (deleted_at);
@@ -784,6 +955,7 @@ CREATE TRIGGER trg_gateways_set_updated_at
 CREATE TABLE unit_networks (
     id          BIGSERIAL   PRIMARY KEY,
     uuid        UUID        NOT NULL DEFAULT uuidv7(),
+    tenant_id   BIGINT      NOT NULL,
     unit_id     BIGINT      NOT NULL,
     gateway_id  BIGINT      NOT NULL,
 
@@ -835,6 +1007,11 @@ CREATE TABLE unit_networks (
     CONSTRAINT fk_unit_networks_gateway
         FOREIGN KEY (gateway_id)
         REFERENCES gateways (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_unit_networks_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
         ON DELETE RESTRICT
 );
 
@@ -843,6 +1020,7 @@ CREATE UNIQUE INDEX uq_unit_networks_gateway_vlan
     ON unit_networks (gateway_id, vlan_id)
     WHERE deleted_at IS NULL;
 
+CREATE INDEX idx_unit_networks_tenant_id  ON unit_networks (tenant_id);
 CREATE INDEX idx_unit_networks_unit_id    ON unit_networks (unit_id);
 CREATE INDEX idx_unit_networks_gateway_id ON unit_networks (gateway_id);
 CREATE INDEX idx_unit_networks_deleted_at ON unit_networks (deleted_at);
@@ -866,6 +1044,7 @@ CREATE TRIGGER trg_unit_networks_set_updated_at
 CREATE TABLE device_credentials (
     id                BIGSERIAL           PRIMARY KEY,
     uuid              UUID                NOT NULL DEFAULT uuidv7(),
+    tenant_id         BIGINT              NOT NULL,
     network_device_id BIGINT              NOT NULL,
 
     credential_type   credential_type     NOT NULL,
@@ -908,13 +1087,345 @@ CREATE TABLE device_credentials (
     CONSTRAINT fk_device_credentials_network_device
         FOREIGN KEY (network_device_id)
         REFERENCES network_devices (id)
-        ON DELETE CASCADE
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_device_credentials_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
 );
 
+CREATE INDEX idx_device_credentials_tenant_id          ON device_credentials (tenant_id);
 CREATE INDEX idx_device_credentials_network_device_id ON device_credentials (network_device_id);
 CREATE INDEX idx_device_credentials_credential_type   ON device_credentials (credential_type);
 CREATE INDEX idx_device_credentials_deleted_at        ON device_credentials (deleted_at);
 
 CREATE TRIGGER trg_device_credentials_set_updated_at
     BEFORE UPDATE ON device_credentials
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- btree_gist is required for the range-exclusion constraint on service_accounts
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+-- ---------------------------------------------------------------------------
+-- service_plans
+-- Catalog of available network service tiers offered by the organization.
+-- A plan record is immutable once it has been referenced by service accounts;
+-- retire old plans with is_active = FALSE rather than deleting them.
+-- ---------------------------------------------------------------------------
+CREATE TYPE service_account_status AS ENUM (
+    'pending',    -- provisioned but service not yet active
+    'active',     -- currently delivering service
+    'suspended',  -- temporarily halted (non-payment, policy, etc.)
+    'cancelled'   -- permanently terminated
+);
+
+CREATE TABLE service_plans (
+    id              BIGSERIAL       PRIMARY KEY,
+    uuid            UUID            NOT NULL DEFAULT uuidv7(),
+    tenant_id       BIGINT          NOT NULL,
+    organization_id BIGINT          NOT NULL,
+
+    -- Identity
+    name            TEXT            NOT NULL,  -- e.g. "Starter 100", "Pro 500", "Gig 1000"
+    description     TEXT,
+
+    -- Speed (Mbps; 0 = unlimited / unthrottled)
+    download_mbps   INTEGER         NOT NULL CHECK (download_mbps >= 0),
+    upload_mbps     INTEGER         NOT NULL CHECK (upload_mbps >= 0),
+
+    -- Pricing
+    price_per_month NUMERIC(10, 2)  NOT NULL CHECK (price_per_month >= 0),
+    setup_fee       NUMERIC(10, 2)  NOT NULL DEFAULT 0.00 CHECK (setup_fee >= 0),
+
+    -- Data cap (NULL = no cap)
+    data_cap_gb     INTEGER         CHECK (data_cap_gb > 0),
+
+    -- Availability
+    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
+                    -- set FALSE to retire the plan; existing accounts are unaffected
+
+    -- Timestamps
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ,
+
+    CONSTRAINT uq_service_plans_uuid     UNIQUE (uuid),
+    CONSTRAINT uq_service_plans_org_name UNIQUE (organization_id, name),
+
+    CONSTRAINT fk_service_plans_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES organizations (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_service_plans_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_service_plans_tenant_id       ON service_plans (tenant_id);
+CREATE INDEX idx_service_plans_organization_id ON service_plans (organization_id);
+CREATE INDEX idx_service_plans_is_active        ON service_plans (is_active);
+CREATE INDEX idx_service_plans_deleted_at       ON service_plans (deleted_at);
+
+CREATE TRIGGER trg_service_plans_set_updated_at
+    BEFORE UPDATE ON service_plans
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- service_accounts
+-- Represents a contracted period of network service delivered to a unit.
+-- A new row is created each time service starts (or restarts after a gap).
+--
+-- Overlap prevention: the EXCLUDE constraint guarantees that no two
+-- service_accounts for the same unit have overlapping active date ranges.
+-- ended_at = NULL means the service is ongoing (open-ended upper bound).
+-- The tstzrange '[)' interval is half-open: includes started_at, excludes
+-- ended_at — so back-to-back periods (end of one = start of next) are
+-- permitted without triggering the exclusion.
+-- ---------------------------------------------------------------------------
+CREATE TABLE service_accounts (
+    id              BIGSERIAL               PRIMARY KEY,
+    uuid            UUID                    NOT NULL DEFAULT uuidv7(),
+    tenant_id       BIGINT                  NOT NULL,
+    unit_id         BIGINT                  NOT NULL,
+    service_plan_id BIGINT                  NOT NULL,
+
+    -- Service period
+    started_at      TIMESTAMPTZ             NOT NULL,
+    ended_at        TIMESTAMPTZ,            -- NULL = currently active / no end date
+
+    status          service_account_status  NOT NULL DEFAULT 'pending',
+
+    -- Optional external reference (e.g. billing system account ID)
+    external_ref    TEXT,
+
+    notes           TEXT,
+
+    -- Timestamps
+    created_at      TIMESTAMPTZ             NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ             NOT NULL DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ,
+
+    CONSTRAINT uq_service_accounts_uuid UNIQUE (uuid),
+
+    CONSTRAINT chk_service_accounts_period CHECK (
+        ended_at IS NULL OR ended_at > started_at
+    ),
+
+    -- Prevent overlapping service periods on the same unit.
+    -- tstzrange('[)', NULL upper) = open-ended / currently active.
+    CONSTRAINT excl_service_accounts_no_overlap
+        EXCLUDE USING gist (
+            unit_id WITH =,
+            tstzrange(started_at, ended_at, '[)') WITH &&
+        )
+        WHERE (deleted_at IS NULL),
+
+    CONSTRAINT fk_service_accounts_unit
+        FOREIGN KEY (unit_id)
+        REFERENCES units (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_service_accounts_service_plan
+        FOREIGN KEY (service_plan_id)
+        REFERENCES service_plans (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_service_accounts_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_service_accounts_tenant_id       ON service_accounts (tenant_id);
+CREATE INDEX idx_service_accounts_unit_id         ON service_accounts (unit_id);
+CREATE INDEX idx_service_accounts_service_plan_id ON service_accounts (service_plan_id);
+CREATE INDEX idx_service_accounts_status          ON service_accounts (status);
+CREATE INDEX idx_service_accounts_started_at      ON service_accounts (started_at);
+CREATE INDEX idx_service_accounts_ended_at        ON service_accounts (ended_at);
+CREATE INDEX idx_service_accounts_deleted_at      ON service_accounts (deleted_at);
+
+CREATE TRIGGER trg_service_accounts_set_updated_at
+    BEFORE UPDATE ON service_accounts
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- users
+-- One row per human interacting with the portal.  The account persists for
+-- the lifetime of the person's relationship with the platform regardless of
+-- which units they live in or manage (residence/association is modelled
+-- separately in user_units).
+--
+-- Authentication is via AWS Cognito; cognito_sub is the immutable Cognito
+-- subject UUID issued at account creation and never changes.
+-- ---------------------------------------------------------------------------
+
+-- Coarse user class determining which portal surface the user accesses and
+-- the baseline set of capabilities available to them.  Fine-grained
+-- permissions within a class are stored as JSONB on the user row.
+CREATE TYPE user_class AS ENUM (
+    'resident',           -- tenant / occupant
+    'property_manager',   -- on-site or portfolio property manager
+    'noc_staff',          -- network operations center technician
+    'admin'               -- full platform administrator (service provider staff)
+);
+
+CREATE TABLE users (
+    id              BIGSERIAL       PRIMARY KEY,
+    uuid            UUID            NOT NULL DEFAULT uuidv7(),
+    tenant_id       BIGINT          NOT NULL,
+
+    -- Cognito identity link — set once at account creation, never updated
+    cognito_sub     TEXT            NOT NULL,
+
+    -- Profile
+    given_name      TEXT            NOT NULL,
+    family_name     TEXT            NOT NULL,
+    email           CITEXT          NOT NULL,
+    phone           TEXT,
+
+    -- Portal access class (coarse)
+    user_class      user_class      NOT NULL DEFAULT 'resident',
+
+    -- Fine-grained permissions within the class, evaluated by the backend.
+    -- Structure is application-defined; stored as JSONB for flexibility.
+    -- Example: {"can_manage_billing": true, "can_submit_tickets": true}
+    permissions     JSONB           NOT NULL DEFAULT '{}',
+
+    -- Account state
+    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
+                    -- FALSE = account suspended / deactivated; blocks login
+
+    -- Timestamps
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ,    -- soft-delete; does not remove Cognito account
+
+    CONSTRAINT uq_users_uuid        UNIQUE (uuid),
+    CONSTRAINT uq_users_cognito_sub UNIQUE (cognito_sub),
+    CONSTRAINT uq_users_email       UNIQUE (email),
+
+    CONSTRAINT fk_users_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_users_tenant_id  ON users (tenant_id);
+CREATE INDEX idx_users_email      ON users (email);
+CREATE INDEX idx_users_user_class ON users (user_class);
+CREATE INDEX idx_users_is_active  ON users (is_active);
+CREATE INDEX idx_users_deleted_at ON users (deleted_at);
+
+CREATE TRIGGER trg_users_set_updated_at
+    BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- user_units
+-- Tracks which units a user is associated with.  A resident living in two
+-- apartments has two rows; a property manager overseeing many units can have
+-- many rows.  Unit association is independent of active service — a user
+-- retains their history even after moving out.
+-- ---------------------------------------------------------------------------
+CREATE TABLE user_units (
+    id          BIGSERIAL   PRIMARY KEY,
+    uuid        UUID        NOT NULL DEFAULT uuidv7(),
+    tenant_id   BIGINT      NOT NULL,
+    user_id     BIGINT      NOT NULL,
+    unit_id     BIGINT      NOT NULL,
+
+    -- Optional date range capturing when the association was / is active.
+    -- NULL = no specific period (e.g. property manager with ongoing access).
+    associated_from TIMESTAMPTZ,
+    associated_to   TIMESTAMPTZ,    -- NULL = still associated
+
+    is_primary  BOOLEAN     NOT NULL DEFAULT FALSE,
+                -- marks the user's "home" unit for notification / billing purposes
+
+    -- Timestamps
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at  TIMESTAMPTZ,
+
+    CONSTRAINT uq_user_units_uuid      UNIQUE (uuid),
+    CONSTRAINT uq_user_units_user_unit UNIQUE (user_id, unit_id),
+    CONSTRAINT chk_user_units_period CHECK (
+        associated_to IS NULL OR associated_to > associated_from
+    ),
+
+    CONSTRAINT fk_user_units_user
+        FOREIGN KEY (user_id)
+        REFERENCES users (id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_user_units_unit
+        FOREIGN KEY (unit_id)
+        REFERENCES units (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_user_units_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_user_units_tenant_id  ON user_units (tenant_id);
+CREATE INDEX idx_user_units_user_id    ON user_units (user_id);
+CREATE INDEX idx_user_units_unit_id    ON user_units (unit_id);
+CREATE INDEX idx_user_units_deleted_at ON user_units (deleted_at);
+
+CREATE TRIGGER trg_user_units_set_updated_at
+    BEFORE UPDATE ON user_units
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- service_account_users
+-- M:M join: which users are associated with a service account.
+-- A household may have multiple adults on the same account; a property
+-- manager may be associated for billing/admin purposes.
+-- ---------------------------------------------------------------------------
+CREATE TABLE service_account_users (
+    id                  BIGSERIAL   PRIMARY KEY,
+    uuid                UUID        NOT NULL DEFAULT uuidv7(),
+    tenant_id           BIGINT      NOT NULL,
+    service_account_id  BIGINT      NOT NULL,
+    user_id             BIGINT      NOT NULL,
+
+    is_primary          BOOLEAN     NOT NULL DEFAULT FALSE,
+                        -- the financially responsible / primary contact for this account
+
+    -- Timestamps
+    created_at  TIMESTAMPTZ         NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ         NOT NULL DEFAULT NOW(),
+    deleted_at  TIMESTAMPTZ,
+
+    CONSTRAINT uq_service_account_users_uuid         UNIQUE (uuid),
+    CONSTRAINT uq_service_account_users_account_user UNIQUE (service_account_id, user_id),
+
+    CONSTRAINT fk_service_account_users_service_account
+        FOREIGN KEY (service_account_id)
+        REFERENCES service_accounts (id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_service_account_users_user
+        FOREIGN KEY (user_id)
+        REFERENCES users (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_service_account_users_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_service_account_users_tenant_id           ON service_account_users (tenant_id);
+CREATE INDEX idx_service_account_users_service_account_id ON service_account_users (service_account_id);
+CREATE INDEX idx_service_account_users_user_id            ON service_account_users (user_id);
+CREATE INDEX idx_service_account_users_deleted_at         ON service_account_users (deleted_at);
+
+CREATE TRIGGER trg_service_account_users_set_updated_at
+    BEFORE UPDATE ON service_account_users
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
