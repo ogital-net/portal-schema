@@ -186,6 +186,10 @@ Install CLI: `cargo install refinery_cli`
 
 1. Create the next migration file: `migrations/V{N}__{description}.sql`
 2. Write forward-only SQL (no rollback blocks).
-3. Test locally against a throwaway database before committing.
+3. Run the smoke-test binary to validate all migrations against a throwaway PostgreSQL 18 container (requires Docker):
+   ```bash
+   cargo run
+   ```
+   The binary exits 0 on success and 1 on failure with a descriptive error.
 4. Commit the file. The Rust backend will pick it up at next startup (via `embed_migrations!`).
 5. To revert a change, create `V{N+1}__revert_{description}.sql`.
