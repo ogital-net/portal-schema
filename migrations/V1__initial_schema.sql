@@ -168,6 +168,26 @@ CREATE TYPE property_type AS ENUM (
     'single_building'     -- standalone single-building property
 );
 
+-- How network access is delivered to residents at the property
+CREATE TYPE property_network_service_type AS ENUM (
+    'wifi_only',              -- residents receive WiFi; no wired Ethernet drop to unit
+    'wired_only',             -- Ethernet jack to unit only; no managed WiFi
+    'wired_and_wifi',         -- both Ethernet drop and managed WiFi provided
+    'mdu_bulk_wifi',          -- bulk/managed WiFi billed through property, not resident
+    'fiber_to_unit',          -- dedicated fiber termination inside each unit
+    'hybrid'                  -- mix of delivery types across unit classes on the property
+);
+
+-- IEEE 802.11 WiFi generation used for resident-facing APs
+CREATE TYPE property_wifi_generation AS ENUM (
+    'wifi_4',   -- 802.11n
+    'wifi_5',   -- 802.11ac
+    'wifi_6',   -- 802.11ax (2.4 / 5 GHz)
+    'wifi_6e',  -- 802.11ax + 6 GHz band
+    'wifi_7',   -- 802.11be (multi-link operation)
+    'wifi_8'    -- 802.11bn (anticipated next generation)
+);
+
 CREATE TYPE unit_type AS ENUM (
     'studio',
     'one_bedroom',
@@ -362,6 +382,22 @@ CREATE TABLE properties (
     year_built      SMALLINT,
     total_floors    SMALLINT,       -- floors across the entire property
     unit_count      INTEGER,        -- advertised / expected unit count (not enforced)
+
+    -- Network service delivery
+    network_service_type    property_network_service_type,
+                            -- how connectivity is delivered to residents; NULL = not yet configured
+    wifi_generation         property_wifi_generation,
+                            -- WiFi generation of resident-facing APs; NULL if wired_only or not yet deployed
+    has_guest_wifi          BOOLEAN NOT NULL DEFAULT FALSE,
+                            -- property offers a separate guest / visitor SSID
+    has_iot_network         BOOLEAN NOT NULL DEFAULT FALSE,
+                            -- dedicated IoT VLAN / SSID for smart-home devices
+    has_bulk_tv             BOOLEAN NOT NULL DEFAULT FALSE,
+                            -- bulk cable/IPTV included in property agreement
+    has_voip                BOOLEAN NOT NULL DEFAULT FALSE,
+                            -- VoIP / managed phone service included
+    uplink_redundancy       BOOLEAN NOT NULL DEFAULT FALSE,
+                            -- TRUE = at least two diverse WAN circuits (failover / load-balance)
 
     -- Operational
     timezone        TEXT            NOT NULL DEFAULT 'America/New_York',
