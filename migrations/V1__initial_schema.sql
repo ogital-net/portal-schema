@@ -813,6 +813,43 @@ CREATE TRIGGER trg_network_devices_set_updated_at
     BEFORE UPDATE ON network_devices
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+-- IEEE 802.3 PoE standard and class that an AP requires from its switch port.
+-- Standard determines the spec; class determines the power budget within that spec.
+CREATE TYPE poe_standard AS ENUM (
+    -- IEEE 802.3af — PoE (original)
+    'ieee_802_3af',          -- up to 15.4 W delivered, 12.95 W at device
+
+    -- IEEE 802.3at — PoE+ (Type 2)
+    'ieee_802_3at',          -- up to 30 W delivered, 25.5 W at device
+
+    -- IEEE 802.3bt — PoE++ (4-pair)
+    'ieee_802_3bt_type3',    -- Type 3: up to 60 W delivered, 51 W at device
+    'ieee_802_3bt_type4',    -- Type 4: up to 90 W delivered, 71.3 W at device
+
+    -- Proprietary / pre-standard
+    'ubiquiti_24v_passive',  -- Ubiquiti 24 V passive PoE (non-standard; no negotiation)
+    'ubiquiti_48v_passive',  -- Ubiquiti 48 V passive PoE (non-standard; no negotiation)
+    'cisco_upoe',            -- Cisco UPOE: up to 60 W over all 4 pairs (pre-bt)
+    'cisco_upoe_plus',       -- Cisco UPOE+: up to 90 W (proprietary extension)
+
+    'none',                  -- device is AC-powered; does not use PoE
+    'other'                  -- non-standard / unknown proprietary scheme
+);
+
+-- IEEE 802.3bt PoE class (0–8) indicating negotiated power level.
+-- Classes 0-3 map to 802.3af/at; 4-8 are 802.3bt-only.
+CREATE TYPE poe_class AS ENUM (
+    'class_0',   -- 0.44–12.94 W at device (802.3af default)
+    'class_1',   -- 0.44–3.84 W at device
+    'class_2',   -- 3.84–6.49 W at device
+    'class_3',   -- 6.49–12.95 W at device (802.3af max)
+    'class_4',   -- 12.95–25.5 W at device (802.3at max)
+    'class_5',   -- 25.5–40 W at device (802.3bt Type 3, single-signature)
+    'class_6',   -- 40–51 W at device  (802.3bt Type 3, dual-signature)
+    'class_7',   -- 51–62 W at device  (802.3bt Type 4, single-signature)
+    'class_8'    -- 62–71.3 W at device (802.3bt Type 4, dual-signature / max)
+);
+
 -- ---------------------------------------------------------------------------
 -- access_points
 -- AP-specific fields for every network_devices row whose device_type =
@@ -842,8 +879,10 @@ CREATE TABLE access_points (
     max_clients       SMALLINT    CHECK (max_clients > 0),
 
     -- Power
-    poe_standard      TEXT,       -- e.g. "802.3af", "802.3at", "802.3bt", "proprietary"
+    poe_standard      poe_standard,   -- PoE spec the AP requires
+    poe_class         poe_class,       -- negotiated power class within that spec
     poe_watts         NUMERIC(5,1) CHECK (poe_watts > 0),
+                      -- actual maximum draw in watts; overrides class-based estimate when known
 
     -- Physical form factor
     is_outdoor_rated  BOOLEAN     NOT NULL DEFAULT FALSE,
