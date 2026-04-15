@@ -274,6 +274,17 @@ CREATE TYPE credential_type AS ENUM (
     'tacacs_plus'       -- TACACS+ shared secret
 );
 
+CREATE TYPE building_construction_type AS ENUM (
+    'wrap',          -- wood-frame units wrap around a concrete podium parking structure
+    'greenfield',    -- new ground-up construction on a previously undeveloped site
+    'garden',        -- low-rise garden-style complex; exterior corridor access, landscaped courtyards
+    'mid_rise',      -- 5–12 story building; typically wood or concrete construction
+    'high_rise',     -- 13+ story building; steel or reinforced concrete
+    'townhouse',     -- attached multi-floor units with individual ground-level entrances
+    'mixed_use',     -- residential over ground-floor retail / commercial
+    'other'
+);
+
 -- ---------------------------------------------------------------------------
 -- organizations
 -- A service-provider sub-entity or brand under a tenant.  One tenant may
@@ -421,7 +432,7 @@ CREATE TABLE buildings (
     -- Physical attributes
     year_built      SMALLINT,
     total_floors    SMALLINT,
-    construction_type TEXT,   -- e.g. "wood frame", "steel", "masonry", "concrete"
+    construction_type building_construction_type,
 
     -- Accessibility
     has_elevator    BOOLEAN     NOT NULL DEFAULT FALSE,
@@ -482,6 +493,8 @@ CREATE TABLE units (
     -- Identity
     unit_number TEXT        NOT NULL, -- "101", "B-204", "PH-3", "Ground Retail"
     floor       SMALLINT,             -- floor level; 0 = ground, negative = below grade
+    floor_count SMALLINT NOT NULL DEFAULT 1 CHECK (floor_count >= 1),
+                        -- number of floors this unit spans (e.g. 2 for a townhouse/maisonette)
 
     -- Classification
     unit_type   unit_type   NOT NULL DEFAULT 'one_bedroom',
