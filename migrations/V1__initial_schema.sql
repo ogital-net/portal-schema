@@ -15,7 +15,7 @@
 --   switches                — switch-specific detail (1:1 with network_devices)
 --   gateways                — gateway-specific detail (1:1 with network_devices)
 --   gateway_interfaces      — per-interface config and IP addressing for a gateway
---   unit_networks           — per-unit VLAN + IPv4/IPv6 network config
+--   unit_networks           — per-unit L2 + DHCP config, linked to IPAM prefixes
 --   device_credentials      — encrypted management credentials per device
 --   service_plans           — available network service tiers
 --   service_accounts        — contracted service period for a unit
@@ -31,6 +31,9 @@
 --   ip_prefixes             — hierarchical prefix registry (RIR → market → property → subscriber)
 --   ip_addresses            — individual host address assignments to gateway interfaces
 --   prefix_assignments      — prefix delegations and block allocations to units
+--   pollers                 — distributed SNMP polling agents
+--   (poller_id on network_devices links each device to its assigned poller)
+--   (poller_interface_ref on gateway_interfaces stores the per-interface opaque ID)
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -684,6 +687,10 @@ CREATE TABLE network_devices (
     installed_at     TIMESTAMPTZ,
     last_seen_at     TIMESTAMPTZ,        -- updated by the NOC polling system
 
+    -- SNMP poller responsible for monitoring this device.
+    -- NULL = unassigned / monitoring not yet configured.
+    poller_id        BIGINT,
+
     notes            TEXT,
 
     -- Timestamps
@@ -749,6 +756,8 @@ CREATE INDEX idx_network_devices_unit_id         ON network_devices (unit_id);
 CREATE INDEX idx_network_devices_manufacturer_id ON network_devices (manufacturer_id);
 CREATE INDEX idx_network_devices_status          ON network_devices (status);
 CREATE INDEX idx_network_devices_device_type     ON network_devices (device_type);
+CREATE INDEX idx_network_devices_poller_id       ON network_devices (poller_id)
+    WHERE poller_id IS NOT NULL;
 CREATE INDEX idx_network_devices_deleted_at      ON network_devices (deleted_at);
 
 CREATE TRIGGER trg_network_devices_set_updated_at
@@ -1014,6 +1023,11 @@ CREATE TABLE gateway_interfaces (
     -- ISP are recorded in ip_prefixes with role = 'wan_delegation'.
     ipv4_gateway    INET,
     ipv6_gateway    INET,
+
+    -- Opaque identifier assigned by the poller for this interface.
+    -- Used to retrieve per-interface traffic graphs from the poller's
+    -- time-series API.  NULL until the poller has indexed the interface.
+    poller_interface_ref    TEXT,
 
     -- Timestamps
     created_at  TIMESTAMPTZ         NOT NULL DEFAULT NOW(),
@@ -1472,9 +1486,25 @@ CREATE TRIGGER trg_prefix_assignments_set_updated_at
 
 -- ---------------------------------------------------------------------------
 -- unit_networks
--- Each unit is assigned exactly one dedicated Layer-2/Layer-3 network segment.
--- The VLAN provides L2 isolation; the IPv4/IPv6 parameters are pushed to the
--- gateway and DHCP server during provisioning.
+-- Captures the Layer-2 and DHCP provisioning configuration for a unit's
+-- dedicated network segment.  IP addressing is managed via the IPAM tables
+-- (ip_prefixes / ip_addresses); this table holds only the data needed to
+-- program the gateway and DHCP server:
+--
+--   gateway_id       — which gateway routes traffic for this unit
+--   vlan_id          — 802.1Q tag that isolates this unit at L2
+--   ipv4_prefix_id   — FK to the ip_prefixes row for the unit's IPv4 subnet
+--                      (prefix_role = 'property_pool' or 'subscriber')
+--   ipv4_dhcp_start/
+--   ipv4_dhcp_end    — DHCP pool range carved from the IPv4 prefix
+--   ipv4_dns_servers — ordered resolver list pushed to clients via DHCP
+--   ipv6_mode        — how the unit receives IPv6 (disabled / SLAAC / DHCPv6)
+--   ipv6_prefix_id   — FK to the ip_prefixes row for the delegated IPv6 prefix
+--                      (prefix_role = 'subscriber', NULL when ipv6_mode = 'disabled')
+--   ipv6_dns_servers — resolver list pushed to clients via RA / DHCPv6
+--
+-- The gateway router address for each prefix is tracked in ip_addresses
+-- (is_gateway = TRUE) and is not duplicated here.
 -- ---------------------------------------------------------------------------
 CREATE TABLE unit_networks (
     id          BIGSERIAL   PRIMARY KEY,
@@ -1486,18 +1516,16 @@ CREATE TABLE unit_networks (
     -- Layer 2
     vlan_id     SMALLINT    NOT NULL CHECK (vlan_id BETWEEN 1 AND 4094),
 
-    -- IPv4
-    ipv4_subnet         CIDR    NOT NULL,       -- e.g. 10.100.1.0/24
-    ipv4_gateway        INET    NOT NULL,        -- first usable / router address
+    -- IPv4 — subnet sourced from IPAM
+    ipv4_prefix_id      BIGINT  NOT NULL,       -- FK → ip_prefixes
     ipv4_dhcp_start     INET    NOT NULL,
     ipv4_dhcp_end       INET    NOT NULL,
     ipv4_dns_servers    INET[]  NOT NULL DEFAULT '{}',
                         -- ordered list; application fills with provider defaults if empty
 
-    -- IPv6
+    -- IPv6 — provisioning mode + optional delegated prefix from IPAM
     ipv6_mode           ipv6_mode NOT NULL DEFAULT 'disabled',
-    ipv6_prefix         CIDR,   -- assigned /64 (or smaller) for this unit
-    ipv6_gateway        INET,
+    ipv6_prefix_id      BIGINT,                 -- FK → ip_prefixes; NULL when ipv6_mode = 'disabled'
     ipv6_dns_servers    INET[]  NOT NULL DEFAULT '{}',
 
     -- Provisioning state
@@ -1516,11 +1544,15 @@ CREATE TABLE unit_networks (
     CONSTRAINT chk_unit_networks_ipv4_dhcp_range CHECK (
         ipv4_dhcp_start <= ipv4_dhcp_end
     ),
-    CONSTRAINT chk_unit_networks_ipv6_fields CHECK (
-        -- prefix and gateway required for stateful IPv6 modes
+    CONSTRAINT chk_unit_networks_ipv6_prefix_required CHECK (
+        -- A delegated prefix is required for stateful IPv6 modes
         ipv6_mode = 'disabled'
         OR ipv6_mode = 'slaac'
-        OR (ipv6_prefix IS NOT NULL AND ipv6_gateway IS NOT NULL)
+        OR ipv6_prefix_id IS NOT NULL
+    ),
+    CONSTRAINT chk_unit_networks_ipv6_prefix_absent_when_disabled CHECK (
+        -- No prefix should be linked when IPv6 is disabled
+        ipv6_mode != 'disabled' OR ipv6_prefix_id IS NULL
     ),
 
     CONSTRAINT fk_unit_networks_unit
@@ -1531,6 +1563,16 @@ CREATE TABLE unit_networks (
     CONSTRAINT fk_unit_networks_gateway
         FOREIGN KEY (gateway_id)
         REFERENCES gateways (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_unit_networks_ipv4_prefix
+        FOREIGN KEY (ipv4_prefix_id)
+        REFERENCES ip_prefixes (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_unit_networks_ipv6_prefix
+        FOREIGN KEY (ipv6_prefix_id)
+        REFERENCES ip_prefixes (id)
         ON DELETE RESTRICT,
 
     CONSTRAINT fk_unit_networks_tenant
@@ -1544,10 +1586,13 @@ CREATE UNIQUE INDEX uq_unit_networks_gateway_vlan
     ON unit_networks (gateway_id, vlan_id)
     WHERE deleted_at IS NULL;
 
-CREATE INDEX idx_unit_networks_tenant_id  ON unit_networks (tenant_id);
-CREATE INDEX idx_unit_networks_unit_id    ON unit_networks (unit_id);
-CREATE INDEX idx_unit_networks_gateway_id ON unit_networks (gateway_id);
-CREATE INDEX idx_unit_networks_deleted_at ON unit_networks (deleted_at);
+CREATE INDEX idx_unit_networks_tenant_id      ON unit_networks (tenant_id);
+CREATE INDEX idx_unit_networks_unit_id        ON unit_networks (unit_id);
+CREATE INDEX idx_unit_networks_gateway_id     ON unit_networks (gateway_id);
+CREATE INDEX idx_unit_networks_ipv4_prefix_id ON unit_networks (ipv4_prefix_id);
+CREATE INDEX idx_unit_networks_ipv6_prefix_id ON unit_networks (ipv6_prefix_id)
+    WHERE ipv6_prefix_id IS NOT NULL;
+CREATE INDEX idx_unit_networks_deleted_at     ON unit_networks (deleted_at);
 
 CREATE TRIGGER trg_unit_networks_set_updated_at
     BEFORE UPDATE ON unit_networks
@@ -1632,10 +1677,17 @@ CREATE TRIGGER trg_device_credentials_set_updated_at
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 -- ---------------------------------------------------------------------------
--- service_plans
--- Catalog of available network service tiers offered by the organization.
--- A plan record is immutable once it has been referenced by service accounts;
--- retire old plans with is_active = FALSE rather than deleting them.
+-- service_plan_templates
+-- Tenant-level master catalog of service tiers.  A tenant is the service
+-- provider / ISP; templates represent the canonical plan definitions they
+-- offer across their portfolio.  They are never directly sold to residents.
+-- Instead, when a property is provisioned, the operator copies whichever
+-- templates apply into that property's service_plans table, optionally
+-- adjusting price or speed for that market.
+--
+-- Templates are immutable in the sense that once a service_plans row
+-- references a template, the template row should only be retired
+-- (is_active = FALSE) rather than deleted, to preserve audit lineage.
 -- ---------------------------------------------------------------------------
 CREATE TYPE service_account_status AS ENUM (
     'pending',    -- provisioned but service not yet active
@@ -1644,11 +1696,10 @@ CREATE TYPE service_account_status AS ENUM (
     'cancelled'   -- permanently terminated
 );
 
-CREATE TABLE service_plans (
+CREATE TABLE service_plan_templates (
     id              BIGSERIAL       PRIMARY KEY,
     uuid            UUID            NOT NULL DEFAULT uuidv7(),
     tenant_id       BIGINT          NOT NULL,
-    organization_id BIGINT          NOT NULL,
 
     -- Identity
     name            TEXT            NOT NULL,  -- e.g. "Starter 100", "Pro 500", "Gig 1000"
@@ -1658,7 +1709,70 @@ CREATE TABLE service_plans (
     download_mbps   INTEGER         NOT NULL CHECK (download_mbps >= 0),
     upload_mbps     INTEGER         NOT NULL CHECK (upload_mbps >= 0),
 
-    -- Pricing
+    -- Pricing (serves as the default; property plans may override)
+    price_per_month NUMERIC(10, 2)  NOT NULL CHECK (price_per_month >= 0),
+    setup_fee       NUMERIC(10, 2)  NOT NULL DEFAULT 0.00 CHECK (setup_fee >= 0),
+
+    -- Data cap (NULL = no cap)
+    data_cap_gb     INTEGER         CHECK (data_cap_gb > 0),
+
+    -- Availability
+    is_active       BOOLEAN         NOT NULL DEFAULT TRUE,
+                    -- set FALSE to retire the template; existing property plans unaffected
+
+    -- Timestamps
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ,
+
+    CONSTRAINT uq_service_plan_templates_uuid        UNIQUE (uuid),
+    CONSTRAINT uq_service_plan_templates_tenant_name UNIQUE (tenant_id, name),
+
+    CONSTRAINT fk_service_plan_templates_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_service_plan_templates_tenant_id  ON service_plan_templates (tenant_id);
+CREATE INDEX idx_service_plan_templates_is_active  ON service_plan_templates (is_active);
+CREATE INDEX idx_service_plan_templates_deleted_at ON service_plan_templates (deleted_at);
+
+CREATE TRIGGER trg_service_plan_templates_set_updated_at
+    BEFORE UPDATE ON service_plan_templates
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- service_plans
+-- Property-scoped service tiers available for sale at a specific property.
+-- Plans are created by copying a service_plan_template during property
+-- provisioning (template_id records the origin) or by creating them
+-- directly on the property.  After the copy, the plan is fully independent
+-- and may be customised (price, speed, cap) for that property's market.
+--
+-- A plan record is immutable once it has been referenced by service accounts;
+-- retire old plans with is_active = FALSE rather than deleting them.
+-- ---------------------------------------------------------------------------
+CREATE TABLE service_plans (
+    id              BIGSERIAL       PRIMARY KEY,
+    uuid            UUID            NOT NULL DEFAULT uuidv7(),
+    tenant_id       BIGINT          NOT NULL,
+    organization_id BIGINT          NOT NULL,
+    property_id     BIGINT          NOT NULL,
+
+    -- Lineage: which template this plan was copied from, if any.
+    -- NULL = plan was created directly on the property (no template source).
+    template_id     BIGINT,
+
+    -- Identity
+    name            TEXT            NOT NULL,  -- e.g. "Starter 100", "Pro 500", "Gig 1000"
+    description     TEXT,
+
+    -- Speed (Mbps; 0 = unlimited / unthrottled)
+    download_mbps   INTEGER         NOT NULL CHECK (download_mbps >= 0),
+    upload_mbps     INTEGER         NOT NULL CHECK (upload_mbps >= 0),
+
+    -- Pricing (may differ from the source template for this property's market)
     price_per_month NUMERIC(10, 2)  NOT NULL CHECK (price_per_month >= 0),
     setup_fee       NUMERIC(10, 2)  NOT NULL DEFAULT 0.00 CHECK (setup_fee >= 0),
 
@@ -1674,13 +1788,24 @@ CREATE TABLE service_plans (
     updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     deleted_at      TIMESTAMPTZ,
 
-    CONSTRAINT uq_service_plans_uuid     UNIQUE (uuid),
-    CONSTRAINT uq_service_plans_org_name UNIQUE (organization_id, name),
+    CONSTRAINT uq_service_plans_uuid          UNIQUE (uuid),
+    CONSTRAINT uq_service_plans_property_name UNIQUE (property_id, name),
 
     CONSTRAINT fk_service_plans_organization
         FOREIGN KEY (organization_id)
         REFERENCES organizations (id)
         ON DELETE RESTRICT,
+
+    CONSTRAINT fk_service_plans_property
+        FOREIGN KEY (property_id)
+        REFERENCES properties (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_service_plans_template
+        FOREIGN KEY (template_id)
+        REFERENCES service_plan_templates (id)
+        ON DELETE SET NULL,
+                    -- nullify lineage if the template is deleted; plan itself survives
 
     CONSTRAINT fk_service_plans_tenant
         FOREIGN KEY (tenant_id)
@@ -1690,8 +1815,11 @@ CREATE TABLE service_plans (
 
 CREATE INDEX idx_service_plans_tenant_id       ON service_plans (tenant_id);
 CREATE INDEX idx_service_plans_organization_id ON service_plans (organization_id);
-CREATE INDEX idx_service_plans_is_active        ON service_plans (is_active);
-CREATE INDEX idx_service_plans_deleted_at       ON service_plans (deleted_at);
+CREATE INDEX idx_service_plans_property_id     ON service_plans (property_id);
+CREATE INDEX idx_service_plans_template_id     ON service_plans (template_id)
+    WHERE template_id IS NOT NULL;
+CREATE INDEX idx_service_plans_is_active       ON service_plans (is_active);
+CREATE INDEX idx_service_plans_deleted_at      ON service_plans (deleted_at);
 
 CREATE TRIGGER trg_service_plans_set_updated_at
     BEFORE UPDATE ON service_plans
@@ -2605,3 +2733,67 @@ CREATE INDEX idx_data_circuits_deleted_at         ON data_circuits (deleted_at);
 CREATE TRIGGER trg_data_circuits_set_updated_at
     BEFORE UPDATE ON data_circuits
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- =============================================================================
+-- SNMP Polling Infrastructure
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- pollers
+-- A distributed SNMP polling agent responsible for monitoring network
+-- devices.  Each poller has a geographic region and a set of credentials
+-- the backend uses to authenticate API calls to it.
+--
+-- SECURITY: client_secret_encrypted holds application-encrypted ciphertext
+-- (AES-256-GCM or similar).  The plaintext secret is never stored here;
+-- key management is handled outside the database (e.g. AWS KMS, Vault).
+-- ---------------------------------------------------------------------------
+CREATE TABLE pollers (
+    id          BIGSERIAL   PRIMARY KEY,
+    uuid        UUID        NOT NULL DEFAULT uuidv7(),
+    tenant_id   BIGINT      NOT NULL,
+
+    -- Identity
+    name        TEXT        NOT NULL,   -- human-readable label, e.g. "us-east-1 poller"
+    region      TEXT        NOT NULL,   -- geographic / logical region, e.g. "us-east-1"
+    hostname    TEXT        NOT NULL,   -- DNS name or IP the backend uses to reach the poller
+
+    -- API credentials — used by the backend to authenticate calls to this poller
+    client_id               TEXT    NOT NULL,
+    client_secret_encrypted BYTEA   NOT NULL,
+                -- Application-encrypted ciphertext; see security note above.
+
+    is_active   BOOLEAN     NOT NULL DEFAULT TRUE,
+
+    notes       TEXT,
+
+    -- Timestamps
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at  TIMESTAMPTZ,
+
+    CONSTRAINT uq_pollers_uuid              UNIQUE (uuid),
+    CONSTRAINT uq_pollers_tenant_name       UNIQUE (tenant_id, name),
+    CONSTRAINT uq_pollers_tenant_client_id  UNIQUE (tenant_id, client_id),
+
+    CONSTRAINT fk_pollers_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_pollers_tenant_id  ON pollers (tenant_id);
+CREATE INDEX idx_pollers_region     ON pollers (region);
+CREATE INDEX idx_pollers_is_active  ON pollers (is_active);
+CREATE INDEX idx_pollers_deleted_at ON pollers (deleted_at);
+
+CREATE TRIGGER trg_pollers_set_updated_at
+    BEFORE UPDATE ON pollers
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Now that pollers exists, add the FK from network_devices.poller_id
+ALTER TABLE network_devices
+    ADD CONSTRAINT fk_network_devices_poller
+        FOREIGN KEY (poller_id)
+        REFERENCES pollers (id)
+        ON DELETE SET NULL;
