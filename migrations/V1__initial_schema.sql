@@ -21,6 +21,7 @@
 --   users                   — human user accounts (Cognito-backed)
 --   user_units              — M:M: users ↔ units
 --   service_account_users   — M:M: users ↔ service accounts
+--   guest_users             — transient visitors, contractors, prospective residents
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -1428,4 +1429,140 @@ CREATE INDEX idx_service_account_users_deleted_at         ON service_account_use
 
 CREATE TRIGGER trg_service_account_users_set_updated_at
     BEFORE UPDATE ON service_account_users
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- guest_users
+-- Transient users of the network service at a property — visitors, contractors,
+-- prospective residents, delivery personnel, etc.  Guest users are not full
+-- platform users; they are verified by a one-time code sent to either an
+-- email address or an SMS-capable phone number (at least one is required).
+--
+-- All other identity fields are optional; tenants configure which fields they
+-- collect via their onboarding flow.  Tenant-specific data not covered by
+-- typed columns goes in extra_data (JSONB).
+-- ---------------------------------------------------------------------------
+
+CREATE TYPE guest_user_type AS ENUM (
+    'visitor',              -- personal guest / friend / family
+    'contractor',           -- tradesperson, maintenance crew, vendor
+    'prospective_resident', -- attending a property showing / leasing tour
+    'delivery',             -- delivery driver, courier, food delivery
+    'event_attendee',       -- attending a scheduled property event
+    'corporate_guest',      -- business / corporate short-term tenant
+    'other'
+);
+
+CREATE TYPE guest_user_status AS ENUM (
+    'pending',   -- contact collected but OTP not yet confirmed
+    'verified',  -- OTP confirmed; identity established
+    'active',    -- within the granted access window and verified
+    'expired',   -- access window has elapsed
+    'revoked'    -- access manually revoked before expiry
+);
+
+CREATE TYPE guest_verification_channel AS ENUM (
+    'email',
+    'sms'
+);
+
+CREATE TABLE guest_users (
+    id              BIGSERIAL                   PRIMARY KEY,
+    uuid            UUID                        NOT NULL DEFAULT uuidv7(),
+    tenant_id       BIGINT                      NOT NULL,
+    property_id     BIGINT                      NOT NULL,
+
+    -- Classification
+    guest_type      guest_user_type             NOT NULL DEFAULT 'visitor',
+    status          guest_user_status           NOT NULL DEFAULT 'pending',
+
+    -- Contact / identity — at least one of email or phone is required;
+    -- enforced by CHECK constraint below.
+    email           CITEXT,
+    phone           TEXT,           -- E.164 recommended, e.g. +12125550100
+
+    -- Optional personal details (tenant-configured; collect what's needed)
+    given_name      TEXT,
+    family_name     TEXT,
+    company         TEXT,           -- employer / organization (useful for contractors)
+
+    -- Purpose of visit (free-text; shown to property managers and NOC)
+    purpose         TEXT,
+
+    -- Access window
+    access_starts_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    access_ends_at      TIMESTAMPTZ,        -- NULL = no fixed end (revoke manually)
+
+    -- WiFi access group this guest should be placed on (e.g. the property guest SSID)
+    ap_group_id         BIGINT,             -- NULL = application default / not yet assigned
+
+    -- Verification outcome — the OTP value itself is NEVER stored here;
+    -- only which channel was used and when the OTP was confirmed.
+    verification_channel    guest_verification_channel,
+    verified_at             TIMESTAMPTZ,    -- NULL = OTP not yet confirmed
+
+    -- Sponsoring user — the resident or staff member who invited or admitted the guest
+    sponsored_by_user_id    BIGINT,         -- NULL = self-registered (public kiosk flow)
+
+    -- Tenant-specific fields not yet promoted to typed columns
+    -- e.g. {"unit_visiting": "204", "vehicle_plate": "XYZ-123", "badge_number": "B-07"}
+    extra_data      JSONB       NOT NULL DEFAULT '{}',
+
+    notes           TEXT,
+
+    -- Timestamps
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ,
+
+    CONSTRAINT uq_guest_users_uuid UNIQUE (uuid),
+
+    -- At least one contact method is required for OTP verification
+    CONSTRAINT chk_guest_users_contact_required CHECK (
+        email IS NOT NULL OR phone IS NOT NULL
+    ),
+    CONSTRAINT chk_guest_users_access_window CHECK (
+        access_ends_at IS NULL OR access_ends_at > access_starts_at
+    ),
+    -- verified_at requires a channel and vice-versa
+    CONSTRAINT chk_guest_users_verification_consistent CHECK (
+        (verified_at IS NULL) = (verification_channel IS NULL)
+    ),
+
+    CONSTRAINT fk_guest_users_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_guest_users_property
+        FOREIGN KEY (property_id)
+        REFERENCES properties (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_guest_users_ap_group
+        FOREIGN KEY (ap_group_id)
+        REFERENCES ap_groups (id)
+        ON DELETE SET NULL,
+
+    CONSTRAINT fk_guest_users_sponsor
+        FOREIGN KEY (sponsored_by_user_id)
+        REFERENCES users (id)
+        ON DELETE SET NULL
+);
+
+CREATE INDEX idx_guest_users_tenant_id           ON guest_users (tenant_id);
+CREATE INDEX idx_guest_users_property_id         ON guest_users (property_id);
+CREATE INDEX idx_guest_users_status              ON guest_users (status);
+CREATE INDEX idx_guest_users_guest_type          ON guest_users (guest_type);
+CREATE INDEX idx_guest_users_email               ON guest_users (email)   WHERE email IS NOT NULL;
+CREATE INDEX idx_guest_users_phone               ON guest_users (phone)   WHERE phone IS NOT NULL;
+CREATE INDEX idx_guest_users_ap_group_id         ON guest_users (ap_group_id);
+CREATE INDEX idx_guest_users_sponsored_by        ON guest_users (sponsored_by_user_id)
+    WHERE sponsored_by_user_id IS NOT NULL;
+CREATE INDEX idx_guest_users_access_ends_at      ON guest_users (access_ends_at)
+    WHERE access_ends_at IS NOT NULL;  -- supports expiry sweeps
+CREATE INDEX idx_guest_users_deleted_at          ON guest_users (deleted_at);
+
+CREATE TRIGGER trg_guest_users_set_updated_at
+    BEFORE UPDATE ON guest_users
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
