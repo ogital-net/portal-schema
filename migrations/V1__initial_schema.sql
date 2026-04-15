@@ -704,6 +704,8 @@ CREATE TABLE device_location_types (
     description TEXT,                   -- optional longer description for UI tooltips
     sort_order  SMALLINT    NOT NULL DEFAULT 0,
                             -- controls display ordering within a category list
+    is_external BOOLEAN     NOT NULL DEFAULT FALSE,
+                            -- TRUE = location is outside the building envelope (outdoor-rated devices required)
     is_active   BOOLEAN     NOT NULL DEFAULT TRUE,
 
     -- Timestamps
@@ -732,30 +734,31 @@ CREATE TRIGGER trg_device_location_types_set_updated_at
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- Global default location types (tenant_id = NULL)
-INSERT INTO device_location_types (tenant_id, slug, label, description, sort_order) VALUES
-    (NULL, 'unit',           'Unit',                    'Inside a resident unit',                                           10),
-    (NULL, 'hallway',        'Hallway',                 'Corridor or hallway on a residential floor',                       20),
-    (NULL, 'lobby',          'Lobby',                   'Building entrance lobby or vestibule',                             30),
-    (NULL, 'stairwell',      'Stairwell',               'Staircase or stairwell enclosure',                                 40),
-    (NULL, 'elevator',       'Elevator',                'Inside or on top of an elevator cab or shaft',                     50),
-    (NULL, 'parking_garage', 'Parking Garage',          'Interior structured parking garage',                               60),
-    (NULL, 'parking_lot',    'Parking Lot',             'Surface-level outdoor parking area',                               70),
-    (NULL, 'community_room', 'Community Room',          'Shared resident amenity room (clubhouse, lounge, etc.)',            80),
-    (NULL, 'fitness_center', 'Fitness Center',          'Gym or fitness room',                                              90),
-    (NULL, 'pool_area',      'Pool Area',               'Indoor or outdoor pool and surrounding deck',                     100),
-    (NULL, 'rooftop',        'Rooftop',                 'Roof deck, rooftop amenity space, or rooftop equipment area',     110),
-    (NULL, 'utility_room',   'Utility Room',            'General mechanical / electrical / utility room',                  120),
-    (NULL, 'mdf',            'MDF / Telecom Closet',    'Main distribution frame or primary telecom/network closet',       130),
-    (NULL, 'idf',            'IDF',                     'Intermediate distribution frame or satellite network closet',     140),
-    (NULL, 'server_room',    'Server Room',             'Dedicated server or data closet (not a full DC)',                 150),
-    (NULL, 'leasing_office', 'Leasing Office',          'Property management or leasing office',                           160),
-    (NULL, 'mailroom',       'Mail Room',               'Package room, mail room, or parcel locker area',                  170),
-    (NULL, 'laundry_room',   'Laundry Room',            'Common-area laundry facility',                                    180),
-    (NULL, 'business_center','Business Center',         'Shared co-working or business center space',                      190),
-    (NULL, 'courtyard',      'Courtyard',               'Open-air courtyard or interior outdoor common area',              200),
-    (NULL, 'outdoor',        'Outdoor',                 'General outdoor area not covered by a more specific type',        210),
-    (NULL, 'storage',        'Storage',                 'Storage room or storage unit area',                               220),
-    (NULL, 'other',          'Other',                   'Location type not covered by any other category',                 999);
+INSERT INTO device_location_types (tenant_id, slug, label, description, sort_order, is_external) VALUES
+    (NULL, 'unit',           'Unit',                    'Inside a resident unit',                                           10,  FALSE),
+    (NULL, 'hallway',        'Hallway',                 'Corridor or hallway on a residential floor',                       20,  FALSE),
+    (NULL, 'lobby',          'Lobby',                   'Building entrance lobby or vestibule',                             30,  FALSE),
+    (NULL, 'stairwell',      'Stairwell',               'Staircase or stairwell enclosure',                                 40,  FALSE),
+    (NULL, 'elevator',       'Elevator',                'Inside or on top of an elevator cab or shaft',                     50,  FALSE),
+    (NULL, 'parking_garage', 'Parking Garage',          'Interior structured parking garage',                               60,  FALSE),
+    (NULL, 'parking_lot',    'Parking Lot',             'Surface-level outdoor parking area',                               70,  TRUE),
+    (NULL, 'community_room', 'Community Room',          'Shared resident amenity room (clubhouse, lounge, etc.)',            80,  FALSE),
+    (NULL, 'fitness_center', 'Fitness Center',          'Gym or fitness room',                                              90,  FALSE),
+    (NULL, 'pool_area',      'Pool Area',               'Indoor or outdoor pool and surrounding deck',                     100,  FALSE),
+    (NULL, 'rooftop',        'Rooftop',                 'Roof deck, rooftop amenity space, or rooftop equipment area',     110,  TRUE),
+    (NULL, 'utility_room',   'Utility Room',            'General mechanical / electrical / utility room',                  120,  FALSE),
+    (NULL, 'mdf',            'MDF / Telecom Closet',    'Main distribution frame or primary telecom/network closet',       130,  FALSE),
+    (NULL, 'idf',            'IDF',                     'Intermediate distribution frame or satellite network closet',     140,  FALSE),
+    (NULL, 'server_room',    'Server Room',             'Dedicated server or data closet (not a full DC)',                 150,  FALSE),
+    (NULL, 'leasing_office', 'Leasing Office',          'Property management or leasing office',                           160,  FALSE),
+    (NULL, 'mailroom',       'Mail Room',               'Package room, mail room, or parcel locker area',                  170,  FALSE),
+    (NULL, 'laundry_room',   'Laundry Room',            'Common-area laundry facility',                                    180,  FALSE),
+    (NULL, 'business_center','Business Center',         'Shared co-working or business center space',                      190,  FALSE),
+    (NULL, 'courtyard',      'Courtyard',               'Open-air courtyard or interior outdoor common area',              200,  TRUE),
+    (NULL, 'nema_enclosure', 'NEMA Enclosure',          'Equipment mounted in an exterior NEMA-rated weatherproof enclosure', 205, TRUE),
+    (NULL, 'outdoor',        'Outdoor',                 'General outdoor area not covered by a more specific type',        210,  TRUE),
+    (NULL, 'storage',        'Storage',                 'Storage room or storage unit area',                               220,  FALSE),
+    (NULL, 'other',          'Other',                   'Location type not covered by any other category',                 999,  FALSE);
 
 -- ---------------------------------------------------------------------------
 -- network_devices
@@ -1827,6 +1830,95 @@ CREATE INDEX idx_device_credentials_deleted_at        ON device_credentials (del
 
 CREATE TRIGGER trg_device_credentials_set_updated_at
     BEFORE UPDATE ON device_credentials
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- oob_devices
+-- OOB-specific detail for every network_devices row whose device_type =
+-- 'other' (or a dedicated oob type once device_type is extended).
+-- Follows the same 1:1 specialization pattern as access_points, switches,
+-- and gateways: network_device_id is NOT NULL + UNIQUE, and CASCADE deletes
+-- this row when the parent device row is removed.
+--
+-- Identity, physical location, manufacturer, model, serial number, MAC,
+-- management IP, and lifecycle fields all live on the network_devices row.
+-- This table holds only OOB-specific operational and cellular details.
+-- Credentials (admin password, SIM PIN, etc.) are stored in device_credentials
+-- referencing the same network_device_id.
+-- ---------------------------------------------------------------------------
+
+CREATE TYPE oob_device_type AS ENUM (
+    'lte_modem',         -- 4G LTE USB or embedded modem
+    '5g_modem',          -- 5G NR modem (sub-6 GHz or mmWave)
+    'lte_router',        -- standalone LTE router/gateway (e.g. Cradlepoint, Peplink)
+    '5g_router',         -- standalone 5G router/gateway
+    'satellite',         -- satellite terminal (e.g. Starlink, Viasat)
+    'dsl_backup',        -- xDSL secondary circuit used as backup
+    'cable_backup',      -- cable/DOCSIS secondary circuit used as backup
+    'fixed_wireless',    -- licensed or unlicensed fixed-wireless backup link
+    'other'
+);
+
+CREATE TYPE oob_device_status AS ENUM (
+    'active',       -- in service and reachable
+    'standby',      -- configured but only activates on primary failure
+    'degraded',     -- reachable but operating below normal (signal, throughput)
+    'offline',      -- unreachable / powered off
+    'decommissioned'
+);
+
+CREATE TABLE oob_devices (
+    id                BIGSERIAL           PRIMARY KEY,
+    uuid              UUID                NOT NULL DEFAULT uuidv7(),
+    tenant_id         BIGINT              NOT NULL,
+    network_device_id BIGINT              NOT NULL,  -- 1:1 with network_devices
+
+    -- Classification
+    device_type     oob_device_type     NOT NULL,
+    oob_status      oob_device_status   NOT NULL DEFAULT 'standby',
+                    -- OOB-specific operational state; complements network_devices.status
+
+    -- SIM / carrier details (relevant for cellular types)
+    carrier_name    TEXT,               -- e.g. "AT&T", "T-Mobile", "Verizon"
+    iccid           TEXT,               -- SIM card ICCID (19–20 digit identifier)
+    imei            TEXT,               -- modem IMEI
+    phone_number    TEXT,               -- assigned MSISDN if carrier provides one
+    apn             TEXT,               -- APN override if not using carrier default
+
+    -- OOB management access (in addition to mgmt_ip on network_devices)
+    mgmt_url        TEXT,               -- web UI or SSH jump URL for NOC access over OOB path
+
+    -- Signal / connectivity telemetry (updated by poller or agent)
+    signal_dbm      SMALLINT,           -- last known RSSI / RSRP in dBm
+
+    notes           TEXT,
+
+    -- Timestamps
+    created_at      TIMESTAMPTZ         NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ         NOT NULL DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ,
+
+    CONSTRAINT uq_oob_devices_uuid              UNIQUE (uuid),
+    CONSTRAINT uq_oob_devices_network_device_id UNIQUE (network_device_id),
+
+    CONSTRAINT fk_oob_devices_network_device
+        FOREIGN KEY (network_device_id)
+        REFERENCES network_devices (id)
+        ON DELETE CASCADE,   -- removing the base device removes the OOB detail
+
+    CONSTRAINT fk_oob_devices_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_oob_devices_tenant_id         ON oob_devices (tenant_id);
+CREATE INDEX idx_oob_devices_network_device_id ON oob_devices (network_device_id);
+CREATE INDEX idx_oob_devices_oob_status        ON oob_devices (oob_status);
+CREATE INDEX idx_oob_devices_deleted_at        ON oob_devices (deleted_at);
+
+CREATE TRIGGER trg_oob_devices_set_updated_at
+    BEFORE UPDATE ON oob_devices
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- btree_gist is required for the range-exclusion constraint on service_accounts
