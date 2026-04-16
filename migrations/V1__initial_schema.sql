@@ -53,6 +53,16 @@
 --   device_command_wal_status — enum: lifecycle states for a WAL entry
 --   device_command_wal        — append-mostly WAL of commands issued to devices;
 --                               tenant-scoped; drives retry logic and audit trail
+--
+-- Hotspot Device Registration:
+--   hotspot_device_type             — enum: phone, laptop, tablet, game_console, etc.
+--   hotspot_device_registration_type — enum: hotspot (time-bounded) | static (permanent MAC)
+--   hotspot_device_status           — enum: pending, active, blocked, expired
+--   hotspot_devices                 — user/guest/org-owned end devices registered for internet
+--                                    access; scoped at any level of the hierarchy
+--                                    (tenant → organization → property → unit);
+--                                    covers both hotspot captive-portal sessions and
+--                                    permanent static MAC registrations
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -4174,4 +4184,228 @@ CREATE INDEX idx_device_command_wal_expires_at        ON device_command_wal (exp
 
 CREATE TRIGGER trg_device_command_wal_set_updated_at
     BEFORE UPDATE ON device_command_wal
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- =============================================================================
+-- Hotspot Device Registration
+-- End-user and guest devices that must be registered before they can access the
+-- internet through the managed network.  Two flows are supported:
+--
+--   hotspot  — self-service captive portal login; access is time-bounded and
+--              the record expires automatically when access_ends_at elapses.
+--
+--   static   — permanent MAC address registration submitted by a resident,
+--              property manager, or NOC staff member.  Does not expire unless
+--              explicitly blocked or soft-deleted.
+--
+-- Scope columns (tenant_id and property_id are always required):
+--
+--   tenant_id       REQUIRED — root network-management scope; MAC uniqueness
+--                              is enforced within a tenant
+--   organization_id optional — narrows registration to a specific org (e.g. an
+--                              organization registering common-area devices
+--                              across all of its properties)
+--   property_id     REQUIRED — every device must be associated with the
+--                              physical property where it connects
+--   unit_id         optional — further narrows to a specific residential unit
+--                              (e.g. a resident's personal laptop)
+--
+-- Ownership (at most one may be set; both may be NULL for shared devices):
+--   user_id       — registered platform user (resident, PM, NOC staff)
+--   guest_user_id — transient guest_users record
+--
+-- These are end-user devices (phones, laptops, consoles, IoT) and are entirely
+-- distinct from ISP-operated network_devices (APs, switches, gateways).
+-- =============================================================================
+
+-- Device category — used for display, analytics, and QoS policy decisions.
+CREATE TYPE hotspot_device_type AS ENUM (
+    'phone',            -- smartphone
+    'tablet',           -- tablet / iPad
+    'laptop',           -- laptop or notebook computer
+    'desktop',          -- desktop or workstation
+    'game_console',     -- gaming console (PlayStation, Xbox, Switch, etc.)
+    'smart_tv',         -- smart TV or media display
+    'streaming_device', -- Chromecast, Roku, Fire Stick, Apple TV, etc.
+    'iot',              -- smart-home device, thermostat, lock, camera, etc.
+    'other'
+);
+
+-- How the device gained access: temporary hotspot session or permanent static MAC.
+CREATE TYPE hotspot_device_registration_type AS ENUM (
+    'hotspot',  -- captive-portal / hotspot login; session expires at access_ends_at
+    'static'    -- explicit MAC registration; persists until blocked or deleted
+);
+
+-- Admission state of the device on the network.
+CREATE TYPE hotspot_device_status AS ENUM (
+    'pending',  -- registered but awaiting approval (if tenant approval workflow is enabled)
+    'active',   -- admitted; traffic forwarded normally
+    'blocked',  -- explicitly denied access (banned MAC or suspended account)
+    'expired'   -- hotspot session window has elapsed; no longer admitted
+);
+
+-- ---------------------------------------------------------------------------
+-- hotspot_devices
+-- One row per registered end-user or guest device.  The mac_address is the
+-- authoritative network identifier; all other fields are metadata.
+--
+-- Scope hierarchy — all nullable except tenant_id and property_id:
+--   tenant_id       — always set; root scope
+--   organization_id — set when registered by / for a specific organization
+--   property_id     — always set; every device must belong to a property
+--   unit_id         — set when registered for a specific residential unit
+--
+-- Ownership is polymorphic:
+--   user_id       — a registered platform user (resident, PM, NOC staff)
+--   guest_user_id — a transient guest_users record
+-- At most one of the two may be set.  Both may be NULL for shared / unclaimed
+-- devices (e.g. a smart-TV registered at the property level, not to a user).
+--
+-- MAC addresses are stored in canonical lowercase colon notation:
+--   aa:bb:cc:dd:ee:ff
+-- The application must normalise the value before insert/update.
+-- ---------------------------------------------------------------------------
+CREATE TABLE hotspot_devices (
+    id              BIGSERIAL                           PRIMARY KEY,
+    uuid            UUID                                NOT NULL DEFAULT uuidv7(),
+
+    -- Scope hierarchy — tenant is always required; the rest narrow scope.
+    -- organization and unit are optional; property is always required.
+    tenant_id       BIGINT                              NOT NULL,
+    organization_id BIGINT,         -- NULL = registration not scoped to a specific org
+    property_id     BIGINT                              NOT NULL,
+    unit_id         BIGINT,         -- NULL unless device belongs to a specific unit
+
+    -- Hardware identity
+    mac_address     TEXT            NOT NULL,   -- lowercase colon notation: aa:bb:cc:dd:ee:ff
+    display_name    TEXT,                       -- human-friendly label, e.g. "John's iPhone"
+    hostname        TEXT,                       -- DHCP-reported hostname (updated by network layer)
+    device_type     hotspot_device_type         NOT NULL DEFAULT 'other',
+
+    -- Registration mode and lifecycle state
+    registration_type   hotspot_device_registration_type    NOT NULL,
+    status              hotspot_device_status               NOT NULL DEFAULT 'pending',
+
+    -- Ownership — at most one of user_id / guest_user_id may be set.
+    user_id             BIGINT,     -- NULL unless owned by a registered platform user
+    guest_user_id       BIGINT,     -- NULL unless owned by a guest_users record
+
+    -- Optional: tie the device to the service account whose quota it counts against.
+    service_account_id  BIGINT,
+
+    -- WiFi placement — controls which AP group / SSID / VLAN this device is placed on.
+    -- NULL = use the most-specific-scope default for the registration type.
+    ap_group_id         BIGINT,
+
+    -- Access window.  Required (non-NULL) for hotspot registrations; optional for static.
+    access_starts_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    access_ends_at      TIMESTAMPTZ,    -- NULL = no expiry (static) or set by hotspot policy
+
+    -- Audit: who performed the registration (NULL = self-registered via captive portal).
+    registered_by_user_id   BIGINT,
+
+    notes           TEXT,
+
+    -- Timestamps
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ,
+
+    CONSTRAINT uq_hotspot_devices_uuid UNIQUE (uuid),
+
+    -- Enforce canonical MAC format: aa:bb:cc:dd:ee:ff
+    CONSTRAINT chk_hotspot_devices_mac_format
+        CHECK (mac_address ~ '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'),
+
+    -- Exactly one owner type at most — user and guest are mutually exclusive.
+    CONSTRAINT chk_hotspot_devices_owner_exclusive
+        CHECK (user_id IS NULL OR guest_user_id IS NULL),
+
+    -- Hotspot registrations must have an expiry date.
+    CONSTRAINT chk_hotspot_devices_hotspot_expiry
+        CHECK (registration_type <> 'hotspot' OR access_ends_at IS NOT NULL),
+
+    -- Access window must be ordered correctly when both bounds are present.
+    CONSTRAINT chk_hotspot_devices_access_window
+        CHECK (access_ends_at IS NULL OR access_ends_at > access_starts_at),
+
+    CONSTRAINT fk_hotspot_devices_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_hotspot_devices_organization
+        FOREIGN KEY (organization_id)
+        REFERENCES organizations (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_hotspot_devices_property
+        FOREIGN KEY (property_id)
+        REFERENCES properties (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_hotspot_devices_unit
+        FOREIGN KEY (unit_id)
+        REFERENCES units (id)
+        ON DELETE SET NULL,
+
+    CONSTRAINT fk_hotspot_devices_user
+        FOREIGN KEY (user_id)
+        REFERENCES users (id)
+        ON DELETE SET NULL,
+
+    CONSTRAINT fk_hotspot_devices_guest_user
+        FOREIGN KEY (guest_user_id)
+        REFERENCES guest_users (id)
+        ON DELETE SET NULL,
+
+    CONSTRAINT fk_hotspot_devices_service_account
+        FOREIGN KEY (service_account_id)
+        REFERENCES service_accounts (id)
+        ON DELETE SET NULL,
+
+    CONSTRAINT fk_hotspot_devices_ap_group
+        FOREIGN KEY (ap_group_id)
+        REFERENCES ap_groups (id)
+        ON DELETE SET NULL,
+
+    CONSTRAINT fk_hotspot_devices_registered_by
+        FOREIGN KEY (registered_by_user_id)
+        REFERENCES users (id)
+        ON DELETE SET NULL
+);
+
+-- A MAC address may only have one active registration per tenant at a time.
+-- The tenant is the root network-management scope; a MAC cannot be active on
+-- two different network segments within the same tenant simultaneously.
+-- Expired and soft-deleted records are excluded so a returning device can be
+-- re-registered cleanly.
+CREATE UNIQUE INDEX uq_hotspot_devices_mac_tenant_active
+    ON hotspot_devices (tenant_id, mac_address)
+    WHERE deleted_at IS NULL AND status <> 'expired';
+
+CREATE INDEX idx_hotspot_devices_tenant_id          ON hotspot_devices (tenant_id);
+CREATE INDEX idx_hotspot_devices_organization_id    ON hotspot_devices (organization_id)
+    WHERE organization_id IS NOT NULL;
+CREATE INDEX idx_hotspot_devices_property_id        ON hotspot_devices (property_id);
+CREATE INDEX idx_hotspot_devices_unit_id            ON hotspot_devices (unit_id)
+    WHERE unit_id IS NOT NULL;
+CREATE INDEX idx_hotspot_devices_mac_address        ON hotspot_devices (mac_address);
+CREATE INDEX idx_hotspot_devices_user_id            ON hotspot_devices (user_id)
+    WHERE user_id IS NOT NULL;
+CREATE INDEX idx_hotspot_devices_guest_user_id      ON hotspot_devices (guest_user_id)
+    WHERE guest_user_id IS NOT NULL;
+CREATE INDEX idx_hotspot_devices_service_account_id ON hotspot_devices (service_account_id)
+    WHERE service_account_id IS NOT NULL;
+CREATE INDEX idx_hotspot_devices_ap_group_id        ON hotspot_devices (ap_group_id)
+    WHERE ap_group_id IS NOT NULL;
+CREATE INDEX idx_hotspot_devices_status             ON hotspot_devices (status);
+CREATE INDEX idx_hotspot_devices_registration_type  ON hotspot_devices (registration_type);
+CREATE INDEX idx_hotspot_devices_access_ends_at     ON hotspot_devices (access_ends_at)
+    WHERE access_ends_at IS NOT NULL;   -- supports expiry sweep job
+CREATE INDEX idx_hotspot_devices_deleted_at         ON hotspot_devices (deleted_at);
+
+CREATE TRIGGER trg_hotspot_devices_set_updated_at
+    BEFORE UPDATE ON hotspot_devices
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
