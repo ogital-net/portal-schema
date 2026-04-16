@@ -6,6 +6,7 @@
 --   platform_config         — per-tenant branding and platform configuration
 --   organizations           — service provider sub-entities / brands under a tenant
 --   property_management_companies — companies responsible for day-to-day property management
+--   property_types          — lookup table for property classification (global defaults + per-tenant)
 --   properties              — physical buildings / complexes
 --   property_contacts       — individual contacts per property displayed to residents
 --   buildings               — individual structures within a property
@@ -185,17 +186,6 @@ CREATE TRIGGER trg_platform_config_set_updated_at
 -- ---------------------------------------------------------------------------
 -- Enum Types
 -- ---------------------------------------------------------------------------
-
-CREATE TYPE property_type AS ENUM (
-    'apartment_complex',  -- traditional multi-unit residential complex
-    'mixed_use',          -- combined commercial + residential
-    'student_housing',    -- student-targeted housing
-    'senior_living',      -- 55+ / assisted-living community
-    'affordable_housing', -- subsidized / income-restricted housing
-    'condo_building',     -- condominium building
-    'townhome_community', -- townhome / row-home development
-    'single_building'     -- standalone single-building property
-);
 
 -- How network access is delivered to residents at the property
 CREATE TYPE property_network_service_type AS ENUM (
@@ -491,6 +481,67 @@ CREATE TRIGGER trg_property_management_companies_set_updated_at
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ---------------------------------------------------------------------------
+-- property_types
+-- Lookup table for the classification of a property.
+--
+-- Rows with tenant_id IS NULL are platform-wide defaults visible to every
+-- tenant.  Rows with tenant_id set are private to that tenant, allowing them
+-- to add custom property types without touching the global list.
+--
+-- Global default rows are seeded by the INSERT block below.  The slug is the
+-- stable machine-readable key; label is the human-facing display string.
+-- ---------------------------------------------------------------------------
+CREATE TABLE property_types (
+    id          BIGSERIAL   PRIMARY KEY,
+    uuid        UUID        NOT NULL DEFAULT uuidv7(),
+
+    -- NULL = global platform default; NOT NULL = tenant-specific custom type
+    tenant_id   BIGINT,
+
+    slug        TEXT        NOT NULL,   -- stable machine key, e.g. 'apartment_complex'
+    label       TEXT        NOT NULL,   -- display name, e.g. 'Apartment Complex'
+    description TEXT,                   -- optional longer description for UI tooltips
+    sort_order  SMALLINT    NOT NULL DEFAULT 0,
+    is_active   BOOLEAN     NOT NULL DEFAULT TRUE,
+
+    -- Timestamps
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_property_types_uuid UNIQUE (uuid),
+
+    -- Global slugs must be unique; tenant slugs must be unique within that tenant
+    CONSTRAINT uq_property_types_tenant_slug
+        UNIQUE NULLS NOT DISTINCT (tenant_id, slug),
+
+    CONSTRAINT fk_property_types_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX idx_property_types_tenant_id ON property_types (tenant_id)
+    WHERE tenant_id IS NOT NULL;
+CREATE INDEX idx_property_types_slug      ON property_types (slug);
+CREATE INDEX idx_property_types_is_active ON property_types (is_active);
+
+CREATE TRIGGER trg_property_types_set_updated_at
+    BEFORE UPDATE ON property_types
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Global default property types (tenant_id = NULL)
+INSERT INTO property_types (tenant_id, slug, label, description, sort_order) VALUES
+    (NULL, 'apartment_complex',  'Apartment Complex',  'Traditional multi-unit residential complex',              10),
+    (NULL, 'mixed_use',          'Mixed Use',           'Combined commercial and residential building',            20),
+    (NULL, 'student_housing',    'Student Housing',     'Student-targeted housing near colleges or universities',  30),
+    (NULL, 'senior_living',      'Senior Living',       '55+ or assisted-living community',                        40),
+    (NULL, 'affordable_housing', 'Affordable Housing',  'Subsidized or income-restricted housing',                 50),
+    (NULL, 'condo_building',     'Condo Building',      'Condominium building',                                    60),
+    (NULL, 'townhome_community', 'Townhome Community',  'Townhome or row-home development',                        70),
+    (NULL, 'single_building',    'Single Building',     'Standalone single-building property',                     80),
+    (NULL, 'other',              'Other',               'Property type not covered by any other category',        999);
+
+-- ---------------------------------------------------------------------------
 -- properties
 -- A physical property (building, complex, campus) managed by an organization.
 -- One organization may own many properties.
@@ -504,7 +555,8 @@ CREATE TABLE properties (
 
     -- Identity
     name            TEXT            NOT NULL,
-    property_type   property_type   NOT NULL DEFAULT 'apartment_complex',
+    property_type_id BIGINT         NOT NULL,
+                    -- FK → property_types; identifies the classification of this property
 
     -- Physical address
     address_line1   TEXT            NOT NULL,
@@ -570,13 +622,19 @@ CREATE TABLE properties (
     CONSTRAINT fk_properties_management_company
         FOREIGN KEY (management_company_id)
         REFERENCES property_management_companies (id)
-        ON DELETE SET NULL
+        ON DELETE SET NULL,
+
+    CONSTRAINT fk_properties_property_type
+        FOREIGN KEY (property_type_id)
+        REFERENCES property_types (id)
+        ON DELETE RESTRICT
 );
 
 CREATE INDEX idx_properties_tenant_id            ON properties (tenant_id);
 CREATE INDEX idx_properties_organization_id      ON properties (organization_id);
 CREATE INDEX idx_properties_management_company_id ON properties (management_company_id)
     WHERE management_company_id IS NOT NULL;
+CREATE INDEX idx_properties_property_type_id     ON properties (property_type_id);
 CREATE INDEX idx_properties_deleted_at           ON properties (deleted_at);
 
 -- Spatial lookup: find all properties within a bounding box
@@ -4278,7 +4336,7 @@ CREATE TABLE hotspot_devices (
     unit_id         BIGINT,         -- NULL unless device belongs to a specific unit
 
     -- Hardware identity
-    mac_address     TEXT            NOT NULL,   -- lowercase colon notation: aa:bb:cc:dd:ee:ff
+    mac_address     MACADDR         NOT NULL,
     display_name    TEXT,                       -- human-friendly label, e.g. "John's iPhone"
     hostname        TEXT,                       -- DHCP-reported hostname (updated by network layer)
     device_type     hotspot_device_type         NOT NULL DEFAULT 'other',
@@ -4313,10 +4371,6 @@ CREATE TABLE hotspot_devices (
     deleted_at      TIMESTAMPTZ,
 
     CONSTRAINT uq_hotspot_devices_uuid UNIQUE (uuid),
-
-    -- Enforce canonical MAC format: aa:bb:cc:dd:ee:ff
-    CONSTRAINT chk_hotspot_devices_mac_format
-        CHECK (mac_address ~ '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'),
 
     -- Exactly one owner type at most — user and guest are mutually exclusive.
     CONSTRAINT chk_hotspot_devices_owner_exclusive
@@ -4409,3 +4463,7 @@ CREATE INDEX idx_hotspot_devices_deleted_at         ON hotspot_devices (deleted_
 CREATE TRIGGER trg_hotspot_devices_set_updated_at
     BEFORE UPDATE ON hotspot_devices
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- OUI tables (oui_organizations, oui_assignments) are defined and seeded
+-- entirely by V2, which is generated by:
+--   cargo run --bin gen-oui-seed > migrations/V2__oui_seed.sql

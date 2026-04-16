@@ -68,6 +68,7 @@ Choose the most semantically appropriate PostgreSQL type. The table below shows 
 | Date only | `DATE` | `chrono::NaiveDate` | `with-chrono-0_4` |
 | Structured / semi-structured data | `JSONB` | `serde_json::Value` | `with-serde_json-1` |
 | IP address | `INET` | `std::net::IpAddr` | — |
+| MAC address | `MACADDR` | `eui48::MacAddress` | `with-eui48-1` |
 | Text search | `TSVECTOR` | — | use `to_tsvector()` |
 | Enumerated set | custom `ENUM` | custom type impl `ToSql`+`FromSql` | — |
 | Arrays | `TEXT[]`, `INTEGER[]`, etc. | `Vec<T>` | — |

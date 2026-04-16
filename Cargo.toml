@@ -8,6 +8,10 @@ description = "Migration smoke-test: spins up a PostgreSQL 18 container and appl
 name = "test-migrations"
 path = "src/main.rs"
 
+[[bin]]
+name = "gen-oui-seed"
+path = "src/gen_oui_seed.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -21,3 +25,7 @@ refinery = { version = "0.9", features = ["tokio-postgres"] }
 # Test containers
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
+
+# OUI seed generator
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+csv = "1"
