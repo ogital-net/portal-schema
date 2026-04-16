@@ -11,6 +11,7 @@
 --   buildings               — individual structures within a property
 --   units                   — individual rentable spaces
 --   manufacturers           — hardware vendor registry
+--   device_platforms        — platform/driver adapter registry; global, application-managed
 --   ap_groups               — WiFi configuration profiles (SSID, security, VLAN)
 --   network_devices         — all managed network equipment at a property
 --   access_points           — AP-specific detail (1:1 with network_devices)
@@ -47,6 +48,11 @@
 --
 -- Physical Infrastructure:
 --   unit_ethernet_jacks     — per-room ethernet wall drops within a unit
+--
+-- Device Command WAL:
+--   device_command_wal_status — enum: lifecycle states for a WAL entry
+--   device_command_wal        — append-mostly WAL of commands issued to devices;
+--                               tenant-scoped; drives retry logic and audit trail
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -339,6 +345,17 @@ CREATE TYPE building_distribution_tech AS ENUM (
     'hybrid_fiber_ghn',         -- fiber to IDF then G.hn over existing wiring to unit
 
     'other'                     -- proprietary or unlisted technology
+);
+
+-- Lifecycle of a single device_command_wal entry from creation through terminal state.
+CREATE TYPE device_command_wal_status AS ENUM (
+    'pending',      -- queued; not yet dispatched to the client library
+    'dispatched',   -- handed off to the client library; awaiting acknowledgment
+    'acknowledged', -- device / client library confirmed receipt; execution in progress
+    'succeeded',    -- command completed successfully
+    'retrying',     -- transient failure; scheduled for retry
+    'failed',       -- terminal failure; retry budget exhausted or non-retriable error
+    'cancelled'     -- explicitly cancelled before reaching a terminal state
 );
 
 -- ---------------------------------------------------------------------------
@@ -865,6 +882,67 @@ CREATE TRIGGER trg_manufacturers_set_updated_at
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ---------------------------------------------------------------------------
+-- device_platforms
+-- Global registry of device platform / driver adapters managed by the
+-- application.  Not tenant-scoped — all tenants share the same set of
+-- platforms.  client_library_key is the stable machine-readable identifier
+-- the Rust backend uses to resolve the correct client-library adapter at
+-- runtime (e.g. a match arm in the dispatcher).
+-- ---------------------------------------------------------------------------
+CREATE TABLE device_platforms (
+    id          BIGSERIAL   PRIMARY KEY,
+    uuid        UUID        NOT NULL DEFAULT uuidv7(),
+
+    -- Stable identifier used by the Rust dispatcher to select the correct
+    -- client library at runtime.  snake_case; treated as immutable after creation.
+    -- Examples: 'ubiquiti_unifi', 'mikrotik_routeros', 'ruckus_smartzone'
+    client_library_key  TEXT    NOT NULL,
+
+    -- Human-readable name shown in the NOC UI.
+    name        TEXT        NOT NULL,
+
+    -- Optional longer description of the platform / supported hardware.
+    description TEXT,
+
+    is_active   BOOLEAN     NOT NULL DEFAULT TRUE,
+
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted_at  TIMESTAMPTZ,
+
+    CONSTRAINT uq_device_platforms_uuid             UNIQUE (uuid),
+    CONSTRAINT uq_device_platforms_client_library_key UNIQUE (client_library_key)
+);
+
+CREATE INDEX idx_device_platforms_is_active  ON device_platforms (is_active);
+CREATE INDEX idx_device_platforms_deleted_at ON device_platforms (deleted_at);
+
+CREATE TRIGGER trg_device_platforms_set_updated_at
+    BEFORE UPDATE ON device_platforms
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- Seed: built-in device platforms
+-- ---------------------------------------------------------------------------
+INSERT INTO device_platforms (client_library_key, name, description)
+VALUES
+    ('ubiquiti_unifi',        'Ubiquiti UniFi',           'UniFi OS controller API — APs, switches, and gateways managed via the UniFi Network Application'),
+    ('ubiquiti_edgemax',      'Ubiquiti EdgeMAX',         'EdgeOS REST/SSH API — EdgeRouter and EdgeSwitch product lines'),
+    ('mikrotik_routeros',     'MikroTik RouterOS',        'RouterOS Winbox/REST API — MikroTik routers and switches running RouterOS v7+'),
+    ('ruckus_smartzone',      'Ruckus SmartZone',         'SmartZone public API — Ruckus APs managed by an on-premises SmartZone controller'),
+    ('ruckus_unleashed',      'Ruckus Unleashed',         'Unleashed multi-AP REST API — controller-less Ruckus deployments'),
+    ('cisco_meraki',          'Cisco Meraki',             'Meraki Dashboard API — cloud-managed Cisco Meraki networking equipment'),
+    ('cisco_ios_xe',          'Cisco IOS XE',             'RESTCONF/NETCONF interface for Cisco IOS XE switches and routers'),
+    ('aruba_central',         'Aruba Central',            'Aruba Central cloud management API — HPE Aruba APs, switches, and gateways'),
+    ('aruba_instant_on',      'Aruba Instant On',         'Instant On cloud API — SMB-targeted Aruba Instant On access points'),
+    ('fortinet_fortigate',    'Fortinet FortiGate',       'FortiOS REST API — FortiGate firewalls and SD-WAN appliances'),
+    ('tp_link_omada',         'TP-Link Omada',            'Omada SDN controller API — TP-Link Omada APs, switches, and routers'),
+    ('netgear_insight',       'NETGEAR Insight',          'Insight cloud management API — NETGEAR managed switches and APs'),
+    ('cambium_cnmaestro',     'Cambium cnMaestro',        'cnMaestro cloud/on-premises API — Cambium Networks wireless infrastructure'),
+    ('generic_snmp',          'Generic SNMP',             'RFC-standard SNMP v2c/v3 — fallback adapter for devices without a vendor API'),
+    ('generic_ssh',           'Generic SSH',              'SSH/CLI adapter — last-resort command dispatch over SSH for unsupported platforms');
+
+-- ---------------------------------------------------------------------------
 -- ap_groups
 -- A named configuration profile applied to one or more access points.
 -- Represents concepts like "Unit WiFi", "Common Area Guest", "IoT VLAN".
@@ -1050,6 +1128,10 @@ CREATE TABLE network_devices (
     -- NULL = unassigned / monitoring not yet configured.
     poller_id        BIGINT,
 
+    -- Platform adapter used to dispatch commands to this device via the WAL.
+    -- NULL = platform not yet identified / unmanaged device.
+    platform_id      BIGINT,
+
     notes            TEXT,
 
     -- Timestamps
@@ -1091,6 +1173,11 @@ CREATE TABLE network_devices (
     CONSTRAINT fk_network_devices_location_type
         FOREIGN KEY (location_type_id)
         REFERENCES device_location_types (id)
+        ON DELETE SET NULL,
+
+    CONSTRAINT fk_network_devices_platform
+        FOREIGN KEY (platform_id)
+        REFERENCES device_platforms (id)
         ON DELETE SET NULL
 );
 
@@ -1124,6 +1211,8 @@ CREATE INDEX idx_network_devices_location_type_id ON network_devices (location_t
 CREATE INDEX idx_network_devices_device_type     ON network_devices (device_type);
 CREATE INDEX idx_network_devices_poller_id       ON network_devices (poller_id)
     WHERE poller_id IS NOT NULL;
+CREATE INDEX idx_network_devices_platform_id     ON network_devices (platform_id)
+    WHERE platform_id IS NOT NULL;
 CREATE INDEX idx_network_devices_deleted_at      ON network_devices (deleted_at);
 
 CREATE TRIGGER trg_network_devices_set_updated_at
@@ -3933,4 +4022,156 @@ CREATE INDEX idx_unit_ethernet_jacks_deleted_at        ON unit_ethernet_jacks (d
 
 CREATE TRIGGER trg_unit_ethernet_jacks_set_updated_at
     BEFORE UPDATE ON unit_ethernet_jacks
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- device_command_wal
+-- Write-ahead log of every command queued or dispatched to a network device.
+-- Append-mostly: new rows are inserted for each command attempt; the status
+-- and retry fields are updated in-place as the command progresses through its
+-- lifecycle.  Scoped to a tenant for isolation and query efficiency.
+-- ---------------------------------------------------------------------------
+CREATE TABLE device_command_wal (
+    id          BIGSERIAL               PRIMARY KEY,
+    uuid        UUID                    NOT NULL DEFAULT uuidv7(),
+
+    -- Tenant scoping — all queries must filter on tenant_id first.
+    tenant_id   BIGINT                  NOT NULL,
+
+    -- Target device.  RESTRICT prevents deleting a device that still has
+    -- non-terminal WAL entries; application must cancel them first.
+    device_id   BIGINT                  NOT NULL,
+
+    -- Platform adapter that will execute this command.  Captures the platform
+    -- at enqueue time so the WAL remains correct even if the device's
+    -- platform_id is later changed.
+    platform_id BIGINT                  NOT NULL,
+
+    -- Machine-readable command verb matching a variant in the platform adapter.
+    -- Examples: 'reboot', 'set_vlan', 'update_firmware', 'apply_acl',
+    --           'set_ssid_password', 'enable_port', 'factory_reset'
+    command_type    TEXT                NOT NULL,
+
+    -- Platform-specific parameters for the command.  Schema is defined and
+    -- validated by the corresponding Rust client library.
+    payload         JSONB               NOT NULL DEFAULT '{}',
+
+    -- ---------------------------------------------------------------------------
+    -- Lifecycle
+    -- ---------------------------------------------------------------------------
+    status          device_command_wal_status   NOT NULL DEFAULT 'pending',
+
+    -- Monotonically incremented each time dispatch is attempted.
+    attempt_count   SMALLINT            NOT NULL DEFAULT 0
+        CONSTRAINT chk_device_command_wal_attempt_count_non_negative CHECK (attempt_count >= 0),
+
+    -- Hard cap on dispatch attempts before the entry is moved to 'failed'.
+    max_attempts    SMALLINT            NOT NULL DEFAULT 3
+        CONSTRAINT chk_device_command_wal_max_attempts_positive CHECK (max_attempts > 0),
+
+    -- Timestamps for dispatch lifecycle milestones.
+    dispatched_at       TIMESTAMPTZ,    -- first successful hand-off to the client library
+    last_attempted_at   TIMESTAMPTZ,    -- most recent attempt regardless of outcome
+    next_retry_at       TIMESTAMPTZ,    -- earliest time a 'retrying' entry may be retried
+    completed_at        TIMESTAMPTZ,    -- set when status transitions to a terminal state
+
+    -- Abandon the entry if it has not reached a terminal state by this time.
+    -- NULL = no expiry (use max_attempts as the only retry bound).
+    expires_at          TIMESTAMPTZ,
+
+    -- Last error message captured from the client library or transport layer.
+    -- Overwritten on each failed attempt; full history is in audit_logs.
+    last_error  TEXT,
+
+    -- ---------------------------------------------------------------------------
+    -- Correlation / tracing
+    -- ---------------------------------------------------------------------------
+
+    -- Groups WAL entries that belong to the same logical operation
+    -- (e.g. a bulk VLAN reconfiguration across multiple devices).
+    -- Indexed to allow efficient lookup of all commands in a batch.
+    correlation_id  UUID,
+
+    -- Idempotency key supplied by the caller to prevent duplicate enqueues
+    -- for the same logical operation.  Unique per tenant when set.
+    idempotency_key TEXT,
+
+    -- User who initiated the command.  NULL = triggered by automation / system.
+    initiated_by_user_id    BIGINT,
+
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_device_command_wal_uuid UNIQUE (uuid),
+
+    -- Prevent duplicate enqueue of the same logical operation per tenant.
+    -- The partial unique index below enforces this only for non-NULL keys;
+    -- the table-level constraint is kept for documentation clarity.
+    CONSTRAINT chk_device_command_wal_attempts_within_budget
+        CHECK (attempt_count <= max_attempts),
+
+    CONSTRAINT chk_device_command_wal_dispatched_before_completed
+        CHECK (dispatched_at IS NULL OR completed_at IS NULL OR dispatched_at <= completed_at),
+
+    CONSTRAINT fk_device_command_wal_tenant
+        FOREIGN KEY (tenant_id)
+        REFERENCES tenants (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_device_command_wal_device
+        FOREIGN KEY (device_id)
+        REFERENCES network_devices (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_device_command_wal_platform
+        FOREIGN KEY (platform_id)
+        REFERENCES device_platforms (id)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_device_command_wal_initiated_by_user
+        FOREIGN KEY (initiated_by_user_id)
+        REFERENCES users (id)
+        ON DELETE SET NULL
+);
+
+-- Primary work-queue scan: fetch pending / retrying entries due for dispatch,
+-- scoped by tenant and ordered by creation time (UUIDv7 natural order).
+CREATE INDEX idx_device_command_wal_work_queue
+    ON device_command_wal (tenant_id, status, next_retry_at)
+    WHERE status IN ('pending', 'retrying');
+
+-- Device-level command history (e.g. "show all commands for device X").
+CREATE INDEX idx_device_command_wal_device_id
+    ON device_command_wal (tenant_id, device_id, created_at DESC);
+
+-- Batch / correlation lookup.
+CREATE INDEX idx_device_command_wal_correlation_id
+    ON device_command_wal (tenant_id, correlation_id)
+    WHERE correlation_id IS NOT NULL;
+
+-- Idempotency key uniqueness scoped to non-NULL values per tenant.
+CREATE UNIQUE INDEX uq_device_command_wal_idempotency
+    ON device_command_wal (tenant_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+
+-- Non-terminal entries for a device — used by the application to check for
+-- in-flight commands before enqueueing conflicting operations.
+CREATE INDEX idx_device_command_wal_device_active
+    ON device_command_wal (tenant_id, device_id)
+    WHERE status NOT IN ('succeeded', 'failed', 'cancelled');
+
+-- Platform-scoped lookup — useful for draining or disabling a specific adapter.
+CREATE INDEX idx_device_command_wal_platform_id
+    ON device_command_wal (tenant_id, platform_id);
+
+CREATE INDEX idx_device_command_wal_tenant_id         ON device_command_wal (tenant_id);
+CREATE INDEX idx_device_command_wal_initiated_by_user ON device_command_wal (initiated_by_user_id)
+    WHERE initiated_by_user_id IS NOT NULL;
+CREATE INDEX idx_device_command_wal_created_at        ON device_command_wal (tenant_id, created_at DESC);
+CREATE INDEX idx_device_command_wal_expires_at        ON device_command_wal (expires_at)
+    WHERE expires_at IS NOT NULL
+      AND status NOT IN ('succeeded', 'failed', 'cancelled');
+
+CREATE TRIGGER trg_device_command_wal_set_updated_at
+    BEFORE UPDATE ON device_command_wal
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
