@@ -118,7 +118,7 @@ VALUES
     (NULL, 'device_registration',       'Device Registration',        'Resident wants to add or remove a managed device',         FALSE, FALSE, 'resident',    20),
     (NULL, 'coverage_complaint',        'Coverage Complaint',         'Weak WiFi signal in unit or common area',                  TRUE,  FALSE, 'resident',    30),
     (NULL, 'latency_complaint',         'Latency Complaint',          'High latency affecting gaming, VoIP, or video calls',      TRUE,  FALSE, 'resident',    40),
-    (NULL, 'security_concern',          'Security Concern',           'Suspected unauthorised access or network abuse',           FALSE, FALSE, 'resident',    50),
+    (NULL, 'security_concern',          'Security Concern',           'Suspected unauthorized access or network abuse',           FALSE, FALSE, 'resident',    50),
     -- Property operations
     (NULL, 'maintenance_coordination',  'Maintenance Coordination',   'ISP must coordinate access with property staff',           FALSE, TRUE,  'operations',  10),
     (NULL, 'planned_maintenance_window','Planned Maintenance Window', 'Scheduled downtime, e.g. backbone or equipment work',      FALSE, TRUE,  'operations',  20),
@@ -271,7 +271,7 @@ CREATE TABLE support_tickets (
     -- Classification
     category_id         BIGINT  NOT NULL,   -- leaf ticket_categories row
     category_type_id    BIGINT  NOT NULL,
-                        -- denormalised FK to ticket_category_types for fast filtering / routing
+                        -- denormalized FK to ticket_category_types for fast filtering / routing
                         -- kept in sync by the application on ticket creation
 
     impact          ticket_impact   NOT NULL DEFAULT 'none',
